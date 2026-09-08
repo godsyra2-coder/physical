@@ -382,7 +382,62 @@ local function createPhysicsTool()
     local tpAtCursorEnabled = false
     local tpSelectionBox = nil
     local mouse = nil
-    
+
+    -- Faint green outline on any part the script has edited
+    local editedBoxes = {}
+    local EDIT_MARKER_CLASSES = {
+        BodyVelocity = true, BodyAngularVelocity = true, BodyForce = true,
+        BodyGyro = true, BodyPosition = true, BodyThrust = true, RocketPropulsion = true,
+        VectorForce = true, LinearVelocity = true, AngularVelocity = true,
+        AlignPosition = true, AlignOrientation = true, Torque = true,
+    }
+    local function markEdited(part)
+        if not part or not part:IsA("BasePart") then return end
+        if editedBoxes[part] then return end
+        if player.Character and part:IsDescendantOf(player.Character) then return end
+        local box = Instance.new("SelectionBox")
+        box.Name = "ScriptEditedOutline"
+        box.Adornee = part
+        box.Color3 = Color3.fromRGB(90, 255, 140)
+        box.LineThickness = 0.02
+        box.Transparency = 0.82
+        box.SurfaceColor3 = Color3.fromRGB(90, 255, 140)
+        box.SurfaceTransparency = 0.97
+        box.Parent = part
+        editedBoxes[part] = box
+    end
+    local function clearEditedMarkers()
+        for _, box in pairs(editedBoxes) do
+            if box then box:Destroy() end
+        end
+        editedBoxes = {}
+    end
+    _G.PhysicsToolClearEditedMarkers = clearEditedMarkers -- run to wipe the green outlines
+    -- Scanner: mark parts that carry a script-created mover, prune dead entries
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            if isToolEquipped then
+                for _, obj in ipairs(workspace:GetDescendants()) do
+                    if obj:IsA("BasePart") and not editedBoxes[obj] then
+                        for _, child in ipairs(obj:GetChildren()) do
+                            if EDIT_MARKER_CLASSES[child.ClassName] then
+                                markEdited(obj)
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+            for part, box in pairs(editedBoxes) do
+                if not part.Parent then
+                    if box then box:Destroy() end
+                    editedBoxes[part] = nil
+                end
+            end
+        end
+    end)
+
     -- Create Axis Display GUI
     local axisDisplayGui = Instance.new("ScreenGui")
     axisDisplayGui.Name = "AxisDisplay"
@@ -4602,23 +4657,14 @@ local function createPhysicsTool()
             return
         end
         
-        for i, selectedPart in ipairs(selectedParts) do
+        -- Left-click is additive, not a toggle. Already selected? Leave it be.
+        -- (Use right-click to deselect a single part.)
+        for _, selectedPart in ipairs(selectedParts) do
             if selectedPart == part then
-                table.remove(selectedParts, i)
-                if selectionBoxes[part] then 
-                    selectionBoxes[part]:Destroy() 
-                    selectionBoxes[part] = nil 
-                end
-                if tpLockedPart == part then
-                    tpLockedPart = nil
-                    tpSelectionBox = nil
-                end
-                updateSelectionStatus()
-                updateTpSelectionStatus()
                 return
             end
         end
-        
+
         if #selectedParts >= maxSelectedParts then
             local oldestPart = selectedParts[1]
             if selectionBoxes[oldestPart] then 
@@ -4665,6 +4711,29 @@ local function createPhysicsTool()
             indicator.Parent = workspace
             
             print("📍 Exact Point: " .. tostring(localPosition) .. " (World: " .. tostring(hitPosition) .. ")")
+        end
+    end
+
+    -- Remove a single part from the selection (right-click)
+    local function deselectPart(part)
+        if not part then return end
+        for i, selectedPart in ipairs(selectedParts) do
+            if selectedPart == part then
+                table.remove(selectedParts, i)
+                if selectionBoxes[part] then
+                    selectionBoxes[part]:Destroy()
+                    selectionBoxes[part] = nil
+                end
+                selectedFaces[part] = nil
+                exactClickPositions[part] = nil
+                if tpLockedPart == part then
+                    tpLockedPart = nil
+                    tpSelectionBox = nil
+                end
+                updateSelectionStatus()
+                updateTpSelectionStatus()
+                return
+            end
         end
     end
 
@@ -11531,7 +11600,15 @@ G - Roll Left     |  H - Roll Right]]
                 teleportPart(tpLockedPart, mouse.Hit.Position)
             end
         end)
-        
+
+        -- Right-click deselects a single part
+        mouse.Button2Down:Connect(function()
+            local target = mouse.Target
+            if target and target.Parent ~= player.Character then
+                deselectPart(target)
+            end
+        end)
+
         -- NEW: Handle drag selection release
         mouse.Button1Up:Connect(function()
             if dragSelectionActive and dragStartPos then
