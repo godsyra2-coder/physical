@@ -1,0 +1,1101 @@
+--// R6 Rig — drivable local puppet + server copy streamed via SyncMove
+--//
+--//  local  : real R6 rig (Motor6D joints + Humanoid + Animator), client-only.
+--//  server : 6 F3X parts (CreatePart -> EscalateEvent claim -> props), anchored.
+--//  bridge : every Heartbeat each local limb's world CFrame -> its server part via
+--//           batched SyncMove, fire-and-forget (never waits on the reply).
+--//
+--//  IDLE mode  : rig stands beside you, GUI plays emotes, "Mirror" copies your pose.
+--//  PILOT mode : YOU drive the rig — WASD walk, Shift run, Space jump, camera follows,
+--//               animations auto-play from Humanoid state. Your real char is frozen.
+--//
+--//  (F3X spawns BaseParts only, so the server rig has no Humanoid — it just follows
+--//   the local rig's pose frame by frame.)
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local UIS               = game:GetService("UserInputService")
+
+local plr = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+local playerControls   -- native movement controls -> GetMoveVector() (keyboard, thumbstick, gamepad)
+pcall(function()
+	local ps = plr:WaitForChild("PlayerScripts", 5)
+	local pm = ps and ps:WaitForChild("PlayerModule", 5)
+	if pm then playerControls = require(pm):GetControls() end
+end)
+
+--// ---------- Building Tools / remotes ----------
+local function getBT()
+	local c = workspace:FindFirstChild(plr.Name)
+	if c then
+		local b = c:FindFirstChild("Building Tools") or c:FindFirstChild("Building Tools Plus")
+		if b then return b end
+	end
+	return plr.Backpack:FindFirstChild("Building Tools") or plr.Backpack:FindFirstChild("Building Tools Plus")
+end
+local bt = getBT()
+assert(bt, "Building Tools not found (backpack or equipped)")
+
+local ep              = bt.SyncAPI.ServerEndpoint
+local EscalateEvent   = ReplicatedStorage.raidRoleplay.Events.EscalateEvent
+local PartOwnership   = ReplicatedStorage.raidRoleplay.Modules.PartOwnership
+local PropertyChanged = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("PropertyChanged")
+
+--// ---------- R6 spec ----------
+local YELLOW = Color3.fromRGB(245, 205, 48)
+local BLUE   = Color3.fromRGB(13, 105, 172)
+local GREEN  = Color3.fromRGB(164, 189, 71)
+
+local RIG = {
+	{ name = "HumanoidRootPart", size = Vector3.new(2,2,1), offset = CFrame.new( 0,    0,   0), color = BLUE,   transparency = 1 },
+	{ name = "Torso",            size = Vector3.new(2,2,1), offset = CFrame.new( 0,    0,   0), color = BLUE   },
+	{ name = "Head",             size = Vector3.new(2,1,1), offset = CFrame.new( 0,    1.5, 0), color = YELLOW },
+	{ name = "Left Arm",         size = Vector3.new(1,2,1), offset = CFrame.new(-1.5,  0,   0), color = YELLOW },
+	{ name = "Right Arm",        size = Vector3.new(1,2,1), offset = CFrame.new( 1.5,  0,   0), color = YELLOW },
+	{ name = "Left Leg",         size = Vector3.new(1,2,1), offset = CFrame.new(-0.5, -2,   0), color = GREEN  },
+	{ name = "Right Leg",        size = Vector3.new(1,2,1), offset = CFrame.new( 0.5, -2,   0), color = GREEN  },
+}
+
+local MOTORS = {
+	{ name = "RootJoint",      p0 = "HumanoidRootPart", p1 = "Torso",     parent = "HumanoidRootPart",
+	  c0 = CFrame.new(0,0,0,   -1,0,0, 0,0,1, 0,1,0), c1 = CFrame.new(0,0,0,   -1,0,0, 0,0,1, 0,1,0) },
+	{ name = "Neck",           p0 = "Torso", p1 = "Head",      parent = "Torso",
+	  c0 = CFrame.new(0,1,0,   -1,0,0, 0,0,1, 0,1,0), c1 = CFrame.new(0,-0.5,0,-1,0,0, 0,0,1, 0,1,0) },
+	{ name = "Left Shoulder",  p0 = "Torso", p1 = "Left Arm",  parent = "Torso",
+	  c0 = CFrame.new(-1,0.5,0, 0,0,-1, 0,1,0, 1,0,0), c1 = CFrame.new(0.5,0.5,0, 0,0,-1, 0,1,0, 1,0,0) },
+	{ name = "Right Shoulder", p0 = "Torso", p1 = "Right Arm", parent = "Torso",
+	  c0 = CFrame.new(1,0.5,0,  0,0,1,  0,1,0, -1,0,0), c1 = CFrame.new(-0.5,0.5,0, 0,0,1, 0,1,0, -1,0,0) },
+	{ name = "Left Hip",       p0 = "Torso", p1 = "Left Leg",  parent = "Torso",
+	  c0 = CFrame.new(-1,-1,0,  0,0,-1, 0,1,0, 1,0,0), c1 = CFrame.new(-0.5,1,0, 0,0,-1, 0,1,0, 1,0,0) },
+	{ name = "Right Hip",      p0 = "Torso", p1 = "Right Leg", parent = "Torso",
+	  c0 = CFrame.new(1,-1,0,   0,0,1,  0,1,0, -1,0,0), c1 = CFrame.new(0.5,1,0, 0,0,1, 0,1,0, -1,0,0) },
+}
+
+local FALLBACK = {
+	idle = "rbxassetid://180435571", walk = "rbxassetid://180426354", run = "rbxassetid://180426354",
+	jump = "rbxassetid://125750702", fall = "rbxassetid://180436148", climb = "rbxassetid://180436334",
+	sit  = "rbxassetid://178130996", wave = "rbxassetid://128777973", point = "rbxassetid://128853357",
+	dance = "rbxassetid://182435998", dance2 = "rbxassetid://182491037", dance3 = "rbxassetid://182491065",
+	laugh = "rbxassetid://129423131", cheer = "rbxassetid://129423030",
+	toolnone = "rbxassetid://182393478", toolslash = "rbxassetid://129967390", toollunge = "rbxassetid://129967478",
+}
+local ONESHOT = { wave = true, point = true, laugh = true, jump = true, toolslash = true, toollunge = true }
+
+local MIRROR_MAP = {
+	Head          = { "Head" },
+	Torso         = { "Torso", "UpperTorso", "LowerTorso" },
+	["Left Arm"]  = { "Left Arm", "LeftUpperArm", "LeftHand" },
+	["Right Arm"] = { "Right Arm", "RightUpperArm", "RightHand" },
+	["Left Leg"]  = { "Left Leg", "LeftUpperLeg", "LeftFoot" },
+	["Right Leg"] = { "Right Leg", "RightUpperLeg", "RightFoot" },
+}
+
+--// ---------- tunables ----------
+local MICRO      = 0.001          -- server parts shrunk to 0.001x, restored visually by a BlockMesh
+local MESH_SCALE = 1 / MICRO      -- => 1000  (tiny part + 1000 block mesh = looks normal, hard to grief)
+local HEAD_MESH       = "rbxasset://fonts/head.mesh"
+local HEAD_MESH_SCALE = 1                 -- FileMesh scale is absolute (not part-relative)
+local BODY_MESH = {                       -- FileMesh per body part (right limbs / left limbs / torso)
+	["Right Arm"] = "rbxassetid://488154808", ["Right Leg"] = "rbxassetid://488154808",
+	["Left Arm"]  = "rbxassetid://488154609", ["Left Leg"]  = "rbxassetid://488154609",
+	["Torso"]     = "rbxassetid://489667862",
+}
+local BODY_MESH_SCALE = 0.01              -- absolute; tune if the meshes come out the wrong size
+local SENDS_PER_TICK = 1          -- fire-and-forget SyncMove calls per tick. sent on BOTH Stepped and
+                                 -- Heartbeat = 2 samples/frame. >1 just duplicates data (congestion).
+
+--// ---------- idle-mode target CFrame ----------
+local lastCF = CFrame.new(0, 5, 0)
+local function getTargetCF()
+	if typeof(_G.R6Rig_Target) == "CFrame" then lastCF = _G.R6Rig_Target; return lastCF end
+	local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+	if r then lastCF = r.CFrame * CFrame.new(4, 0, 0) end
+	return lastCF
+end
+
+local parkCF     -- set when PILOT turns off: rig stays exactly where you left it
+local curScale = 1
+local swordOn = false
+local localSword                                                       -- pooled sword part (client side)
+--// Right Arm -> sword: position (studs, arm-local) then rotation. tune live with _G.R6Rig_SwordGrip
+local swordGripCF = CFrame.new(0, -1, -1.4) * CFrame.Angles(math.rad(-180), 0, math.rad(90))
+local setSword, swordSwing        -- defined after the replicator (need `invoke`)
+local function baseCF()
+	if typeof(_G.R6Rig_Target) == "CFrame" then return _G.R6Rig_Target end
+	return parkCF or getTargetCF()
+end
+_G.R6Rig_Follow = function() parkCF = nil end   -- resume following you
+
+--// ---------- LOCAL rig ----------
+local localModel = Instance.new("Model")
+localModel.Name = "LocalR6Rig"
+localModel.Parent = workspace
+
+local localParts = {}
+for _, s in ipairs(RIG) do
+	local p = Instance.new("Part")
+	p.Name = s.name;  p.Size = s.size;  p.Color = s.color
+	p.Material = Enum.Material.Plastic
+	p.Transparency = s.transparency or 0
+	p.Anchored = (s.name == "HumanoidRootPart")
+	p.CastShadow = false
+	p.CanCollide = false;  p.CanQuery = false;  p.CanTouch = false;  p.Massless = true
+	p.TopSurface = Enum.SurfaceType.Smooth;  p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Parent = localModel
+	localParts[s.name] = p
+end
+localModel.PrimaryPart = localParts.HumanoidRootPart
+localParts.HumanoidRootPart.CFrame = getTargetCF()
+
+do  --// local rig gets the same meshes as the server copy
+	local hm = Instance.new("SpecialMesh")
+	hm.MeshType = Enum.MeshType.FileMesh
+	hm.MeshId   = HEAD_MESH
+	hm.Scale    = Vector3.new(HEAD_MESH_SCALE, HEAD_MESH_SCALE, HEAD_MESH_SCALE)
+	hm.Parent   = localParts.Head
+	for name, id in pairs(BODY_MESH) do
+		local bm = Instance.new("SpecialMesh")
+		bm.MeshType = Enum.MeshType.FileMesh
+		bm.MeshId   = id
+		bm.Scale    = Vector3.new(BODY_MESH_SCALE, BODY_MESH_SCALE, BODY_MESH_SCALE)
+		bm.Parent   = localParts[name]
+	end
+end
+
+local motorRec = {}
+for _, m in ipairs(MOTORS) do
+	local mot = Instance.new("Motor6D")
+	mot.Name = m.name
+	mot.Part0 = localParts[m.p0];  mot.Part1 = localParts[m.p1]
+	mot.C0 = m.c0;  mot.C1 = m.c1
+	mot.Parent = localParts[m.parent]
+	motorRec[#motorRec + 1] = { inst = mot, c0 = m.c0, c1 = m.c1 }
+end
+
+local hum = Instance.new("Humanoid")
+hum.RigType = Enum.HumanoidRigType.R6
+hum.BreakJointsOnDeath = false
+hum.RequiresNeck = false
+hum.MaxHealth = math.huge
+hum.Health = math.huge
+hum.PlatformStand = true          -- idle mode: no walking/falling
+hum.Parent = localModel
+
+local animator = Instance.new("Animator")
+animator.Parent = hum
+
+--// ---------- SERVER rig ----------
+local serverParts = {}
+do
+	local done = 0
+	for _, s in ipairs(RIG) do
+		task.spawn(function()
+			if s.name ~= "HumanoidRootPart" then   -- HRP is invisible + non-colliding: no server part needed
+				local cf = getTargetCF() * s.offset
+				local part = ep:InvokeServer("CreatePart", "Normal", cf, workspace)
+				if part then
+					EscalateEvent:FireServer(PartOwnership, { [1] = part })
+					local t0 = os.clock()
+					repeat task.wait(0.01) until part:FindFirstChild("RRPartOwner") or (os.clock() - t0) > 5
+					if part:FindFirstChild("RRPartOwner") then
+						ep:InvokeServer("SyncResize",    { [1] = { Part = part, Size = s.size * MICRO, CFrame = cf } })
+						ep:InvokeServer("SetName",       { part }, s.name)
+						ep:InvokeServer("SyncColor",     { [1] = { Part = part, Color = s.color } })
+						ep:InvokeServer("SyncMaterial",  { [1] = { Part = part, Material = Enum.Material.Plastic, Transparency = s.transparency or 0 } })
+						ep:InvokeServer("SyncCollision", { [1] = { Part = part, CanCollide = false } })
+						ep:InvokeServer("CreateMeshes",  { [1] = { Part = part } })
+						--// FileMesh Scale is ABSOLUTE (not part-relative like BlockMesh) — no 1/MICRO multiplier.
+						local meshId = (s.name == "Head") and HEAD_MESH or BODY_MESH[s.name]
+						local ms = (s.name == "Head") and HEAD_MESH_SCALE or BODY_MESH_SCALE
+						if meshId then
+							ep:InvokeServer("SyncMesh", { [1] = { Part = part, MeshType = Enum.MeshType.FileMesh,
+								MeshId = meshId, Scale = Vector3.new(ms, ms, ms) } })
+						else
+							ep:InvokeServer("SyncMesh", { [1] = { Part = part, MeshType = Enum.MeshType.Brick,
+								Scale = Vector3.new(MESH_SCALE, MESH_SCALE, MESH_SCALE) } })
+						end
+						ep:InvokeServer("SyncAnchor",    { [1] = { Part = part, Anchored = true } })
+						if PropertyChanged then
+							pcall(function() PropertyChanged:FireServer(part, "CastShadow", false) end)  -- ⚠ signature guessed: (part, prop, value)
+						end
+						serverParts[s.name] = part
+					end
+				end
+			end
+			done += 1
+		end)
+		task.wait(0.0001)
+	end
+	repeat task.wait() until done >= #RIG
+	local all = {}
+	for _, s in ipairs(RIG) do if serverParts[s.name] then all[#all + 1] = serverParts[s.name] end end
+	if #all > 0 then
+		local m = ep:InvokeServer("CreateGroup", "Model", workspace, all)
+		if m then ep:InvokeServer("SetName", { m }, "R6Rig") end
+	end
+	print("[rig] server rig:", #all, "/", #RIG - 1)
+end
+
+--// flat pair list (built once) so the replicator does no lookups / no allocation per loop
+local moveList = {}
+for _, s in ipairs(RIG) do
+	local sp = serverParts[s.name]
+	if sp then moveList[#moveList + 1] = { sp = sp, lp = localParts[s.name], body = true, head = (s.name == "Head") } end
+end
+
+--// ---------- animation ----------
+local mode = "anim"      -- "anim" | "mirror"
+local piloting = false
+local currentTrack, autoState
+local trackCache = {}
+
+local function resolveAnimId(cat)
+	local animate = plr.Character and plr.Character:FindFirstChild("Animate")
+	if animate then
+		local folder = animate:FindFirstChild(cat)
+		if folder then
+			for _, ch in ipairs(folder:GetChildren()) do
+				if ch:IsA("Animation") and ch.AnimationId ~= "" then return ch.AnimationId end
+			end
+		end
+	end
+	return FALLBACK[cat] or FALLBACK.idle
+end
+
+--// sword anims outrank everything else. hold pose (toolnone) is a persistent overlay
+--// at Action2 so it owns the arms over walk/idle; swings punch through at Action4.
+local PRIORITY = {
+	toolslash = Enum.AnimationPriority.Action4,
+	toollunge = Enum.AnimationPriority.Action4,
+}
+
+local function stopTrack()
+	if currentTrack then currentTrack:Stop(0.15); currentTrack = nil end
+end
+
+local function playCore(cat)
+	stopTrack()
+	if cat == "stop" then return end
+	local tr = trackCache[cat]
+	if not tr then
+		local a = Instance.new("Animation")
+		a.AnimationId = resolveAnimId(cat)
+		local ok, res = pcall(function() return animator:LoadAnimation(a) end)
+		if not ok then warn("[rig] load failed:", cat, res); return end
+		tr = res;  trackCache[cat] = tr
+	end
+	if PRIORITY[cat] then tr.Priority = PRIORITY[cat] end
+	tr.Looped = not ONESHOT[cat]
+	tr:Play(0.12)
+	currentTrack = tr
+end
+
+local function autoAnim(cat)          -- pilot: state-driven
+	if autoState == cat then return end
+	autoState = cat
+	playCore(cat)
+end
+
+local function setMirror(on)
+	if on then
+		mode = "mirror"; stopTrack()
+		for _, s in ipairs(RIG) do localParts[s.name].Anchored = true end
+	else
+		mode = "anim"
+		for _, s in ipairs(RIG) do
+			localParts[s.name].Anchored = (s.name == "HumanoidRootPart")
+		end
+	end
+end
+
+local function playCat(cat)            -- GUI emote button
+	if piloting then return end
+	if mode == "mirror" then setMirror(false); if mirrorBtn then end end
+	autoState = nil
+	playCore(cat)
+end
+
+--// ---------- PILOT ----------
+local savedWS, savedJP, savedJH
+local function setPilot(on)
+	if on == piloting then return end
+	piloting = on
+	local realHum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+
+	if on then
+		if mode == "mirror" then setMirror(false) end
+		autoState = nil
+		hum.PlatformStand = false
+		localParts.HumanoidRootPart.Anchored = false
+		localParts["Left Leg"].CanCollide = true
+		localParts["Right Leg"].CanCollide = true
+		localParts.HumanoidRootPart.CFrame = localParts.HumanoidRootPart.CFrame + Vector3.new(0, 2, 0)
+		cam.CameraSubject = hum
+		if realHum then
+			savedWS, savedJP, savedJH = realHum.WalkSpeed, realHum.JumpPower, realHum.JumpHeight
+			realHum.WalkSpeed, realHum.JumpPower, realHum.JumpHeight = 0, 0, 0
+		end
+	else
+		if swordOn and setSword then setSword(false) end
+		local hrp = localParts.HumanoidRootPart
+		local pos, lv = hrp.Position, hrp.CFrame.LookVector
+		local flat = Vector3.new(lv.X, 0, lv.Z)
+		if flat.Magnitude < 1e-3 then flat = Vector3.new(0, 0, -1) end
+		parkCF = CFrame.lookAt(pos, pos + flat)   -- freeze exactly here, upright (never snaps back to you)
+		hum:Move(Vector3.zero)
+		hum.PlatformStand = true
+		hrp.Anchored = true
+		localParts["Left Leg"].CanCollide = false
+		localParts["Right Leg"].CanCollide = false
+		if realHum then
+			cam.CameraSubject = realHum
+			realHum.WalkSpeed = savedWS or 16
+			realHum.JumpPower = savedJP or 0
+			realHum.JumpHeight = savedJH or 7.2
+		end
+		autoState = nil
+		playCore("idle")
+	end
+	if pilotBtn then
+		pilotBtn.BackgroundColor3 = on and Color3.fromRGB(190, 95, 60) or Color3.fromRGB(46, 46, 56)
+		pilotBtn.Text = on and "PILOT: ON  (Esc-btn to stop)" or "PILOT"
+	end
+end
+_G.R6Rig_Pilot = setPilot
+
+UIS.JumpRequest:Connect(function()
+	if piloting and not UIS:GetFocusedTextBox() then hum.Jump = true end
+end)
+hum.Died:Connect(function()
+	if piloting then setPilot(false) end
+end)
+
+--// ---------- per-frame ----------
+local alive = true
+RunService.RenderStepped:Connect(function()
+	if not alive then return end
+
+	if piloting then
+		local typing = UIS:GetFocusedTextBox() ~= nil   -- chat / textbox open -> don't drive the rig
+		local dir = Vector3.zero
+		if not typing then
+			if playerControls then
+				dir = playerControls:GetMoveVector()                          -- native input: keyboard + thumbstick + gamepad
+			else                                                             -- fallback: raw WASD, camera-relative
+				if UIS:IsKeyDown(Enum.KeyCode.W) then dir += Vector3.new(0, 0, -1) end
+				if UIS:IsKeyDown(Enum.KeyCode.S) then dir += Vector3.new(0, 0,  1) end
+				if UIS:IsKeyDown(Enum.KeyCode.A) then dir += Vector3.new(-1, 0, 0) end
+				if UIS:IsKeyDown(Enum.KeyCode.D) then dir += Vector3.new( 1, 0, 0) end
+			end
+		end
+		dir = Vector3.new(dir.X, 0, dir.Z)
+		if dir.Magnitude > 1 then dir = dir.Unit end                          -- clamp; analog stick pushes stay partial
+
+		local running = not typing and (
+			UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.RightShift)
+			or (not UIS.KeyboardEnabled and dir.Magnitude > 0.9)   -- touch: full stick = run
+		)
+		hum.WalkSpeed = running and 24 or 16
+		hum:Move(dir, true)   -- true = relative to camera (matches GetMoveVector's space)
+
+		local st = hum:GetState()
+		if st == Enum.HumanoidStateType.Jumping then
+			autoAnim("jump")
+		elseif st == Enum.HumanoidStateType.Freefall then
+			autoAnim("fall")
+		elseif st == Enum.HumanoidStateType.Climbing then
+			autoAnim("climb")
+		elseif hum.MoveDirection.Magnitude > 0.05 then
+			autoAnim(running and "run" or "walk")
+			if currentTrack then currentTrack:AdjustSpeed(hum.WalkSpeed / 16) end
+		else
+			autoAnim("idle")   -- toolnone is a separate persistent overlay (holdTrack), not a state
+		end
+	else
+		local base = baseCF() * CFrame.new(0, 3 * (curScale - 1), 0)   -- lift so bigger rigs keep feet on ground
+		localParts.HumanoidRootPart.CFrame = base
+		if mode == "mirror" then
+			local char = plr.Character
+			local chrp = char and char:FindFirstChild("HumanoidRootPart")
+			if chrp then
+				for rigName, cands in pairs(MIRROR_MAP) do
+					local cp
+					for _, n in ipairs(cands) do cp = char:FindFirstChild(n); if cp then break end end
+					if cp then localParts[rigName].CFrame = base * (chrp.CFrame:Inverse() * cp.CFrame) end
+				end
+			end
+		end
+	end
+
+	for i = 1, #moveList do
+		local sp = moveList[i].sp
+		sp.LocalTransparencyModifier = 1        -- hide server copy (incl. sword) from yourself
+		sp.CastShadow = false                   -- and never render its shadow locally
+	end
+end)
+
+--// sword follows the Right Arm AFTER the animation pose is applied, so grip pos+rot always land
+RunService:BindToRenderStep("R6RigSword", Enum.RenderPriority.Character.Value + 1, function()
+	if alive and localSword then
+		local g = swordGripCF
+		local grip = (g - g.Position) + g.Position * curScale   -- keep rotation, scale the offset with the rig
+		localSword.CFrame = localParts["Right Arm"].CFrame * grip
+	end
+end)
+
+--// ---------- movement replicator: fire-and-forget, changed-parts-only ----------
+--// never wait on a reply. only send a part whose pose actually moved since last send,
+--// so idle limbs don't hog the pipe and the parts that DO move get through sooner.
+--// sent on Stepped and Heartbeat both -> 2 fresh samples per rendered frame.
+local invoke = ep.InvokeServer
+local function fire(b) pcall(invoke, ep, "SyncMove", b) end
+
+do
+	local last = {}
+	local function push()
+		if not alive then return end
+		local batch
+		for i = 1, #moveList do   -- live length: the sword blade is appended later
+			local cf = moveList[i].lp.CFrame
+			local p = last[i]
+			if (not p) or (cf.Position - p.Position).Magnitude > 0.02
+			   or cf.LookVector:Dot(p.LookVector) < 0.9997 then
+				last[i] = cf
+				batch = batch or {}
+				batch[#batch + 1] = { Part = moveList[i].sp, CFrame = cf }
+			end
+		end
+		if batch then
+			for _ = 1, SENDS_PER_TICK do task.spawn(fire, batch) end
+		end
+	end
+	RunService.Stepped:Connect(push)
+	RunService.Heartbeat:Connect(push)
+end
+
+--// ---------- noob size (scales local skeleton + server BlockMesh) ----------
+local SCALE_MIN, SCALE_MAX = 0.1, 12
+local SCALE_MID = math.log(1 / SCALE_MIN) / math.log(SCALE_MAX / SCALE_MIN)   -- knob fraction where k = 1x
+local function scalePos(cf, k)
+	local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
+	return CFrame.new(x * k, y * k, z * k, r00, r01, r02, r10, r11, r12, r20, r21, r22)
+end
+local meshStamp = 0
+local function setScale(k)
+	curScale = k
+	for _, s in ipairs(RIG) do localParts[s.name].Size = s.size * k end           -- local skeleton, live
+	for _, r in ipairs(motorRec) do
+		r.inst.C0 = scalePos(r.c0, k)
+		r.inst.C1 = scalePos(r.c1, k)
+	end
+	if localSword then                                                            -- sword scales with the rig
+		local sm = localSword:FindFirstChildOfClass("SpecialMesh")
+		if sm then sm.Scale = Vector3.new(k, k, k) end
+	end
+	for _, s in ipairs(RIG) do                                                    -- local head + body meshes
+		local m = localParts[s.name]:FindFirstChildOfClass("SpecialMesh")
+		if m then
+			local ms = (s.name == "Head") and HEAD_MESH_SCALE or BODY_MESH_SCALE
+			m.Scale = Vector3.new(ms * k, ms * k, ms * k)
+		end
+	end
+	local stamp = os.clock()
+	meshStamp = stamp
+	task.delay(0.05, function()                                                   -- server meshes, debounced
+		if meshStamp ~= stamp then return end
+		local headS, bodyS = HEAD_MESH_SCALE * k, BODY_MESH_SCALE * k
+		local head = Vector3.new(headS, headS, headS)
+		local body = Vector3.new(bodyS, bodyS, bodyS)
+		for _, e in ipairs(moveList) do
+			task.spawn(function()
+				pcall(invoke, ep, "SyncMesh", { [1] = { Part = e.sp,
+					Scale = e.head and head or e.body and body or Vector3.new(k, k, k) } })
+			end)
+		end
+	end)
+end
+_G.R6Rig_Scale = setScale
+
+--// ---------- skins ----------
+local FACE = "rbxasset://textures/face.png"
+local SKINS = {
+	{ name = "Classic", body = YELLOW,                    torso = BLUE,                       legs = GREEN,                       mat = "SmoothPlastic" },
+	{ name = "Shadow",  body = Color3.fromRGB(24,24,30),  torso = Color3.fromRGB(14,14,18),   legs = Color3.fromRGB(24,24,30),   mat = "Slate",    reflect = 0.08, glow = Color3.fromRGB(255,45,45) },
+	{ name = "Neon",    body = Color3.fromRGB(0,255,200), torso = Color3.fromRGB(255,0,140),  legs = Color3.fromRGB(150,0,255),  mat = "Neon",     glow = Color3.fromRGB(0,255,200) },
+	{ name = "Gold",    body = Color3.fromRGB(255,205,70),torso = Color3.fromRGB(190,140,25), legs = Color3.fromRGB(255,205,70), mat = "Metal",    reflect = 0.45, glow = Color3.fromRGB(255,220,120) },
+	{ name = "Ice",     body = Color3.fromRGB(205,242,255),torso = Color3.fromRGB(150,210,255),legs = Color3.fromRGB(205,242,255),mat = "Glass",   reflect = 0.35, trans = 0.15, glow = Color3.fromRGB(170,225,255) },
+	{ name = "Void",    body = Color3.fromRGB(45,0,70),   torso = Color3.fromRGB(22,0,38),    legs = Color3.fromRGB(45,0,70),    mat = "Neon",     glow = Color3.fromRGB(170,0,255) },
+	{ name = "Lava",    body = Color3.fromRGB(255,90,20), torso = Color3.fromRGB(40,20,18),   legs = Color3.fromRGB(255,90,20),  mat = "Neon",     glow = Color3.fromRGB(255,120,30) },
+}
+local skinIdx = 1
+local swordTrail
+local tessParts
+local function tessColor() local sk = SKINS[skinIdx]; return sk.glow or Color3.fromRGB(120, 220, 255) end
+
+do  --// local face decal
+	local d = Instance.new("Decal")
+	d.Name = "face";  d.Face = Enum.NormalId.Front;  d.Texture = FACE
+	d.Parent = localParts.Head
+end
+
+local glow = Instance.new("Highlight")   --// client-only outline glow
+glow.Adornee = localModel
+glow.FillTransparency = 1
+glow.OutlineTransparency = 0
+glow.DepthMode = Enum.HighlightDepthMode.Occluded
+glow.Parent = localModel
+
+local function colorFor(sk, name)
+	if name == "Torso" or name == "HumanoidRootPart" then return sk.torso end
+	if name == "Left Leg" or name == "Right Leg" then return sk.legs end
+	return sk.body
+end
+
+local skinStamp = 0
+local function applySkin(i)
+	skinIdx = ((i - 1) % #SKINS) + 1
+	local sk = SKINS[skinIdx]
+	local mat = Enum.Material[sk.mat] or Enum.Material.Plastic
+	for _, s in ipairs(RIG) do
+		local p = localParts[s.name]
+		p.Color = colorFor(sk, s.name)
+		p.Material = mat
+		p.Reflectance = sk.reflect or 0
+		if s.name ~= "HumanoidRootPart" then p.Transparency = sk.trans or 0 end
+	end
+	glow.OutlineColor = sk.glow or sk.body
+	glow.Enabled = sk.glow ~= nil
+	if swordTrail then swordTrail.Color = ColorSequence.new(sk.glow or sk.body) end
+	if tessParts then
+		local tc = tessColor()
+		local tb = {}
+		for _, e in ipairs(tessParts) do
+			e.lp.Color = tc
+			if e.sp then tb[#tb + 1] = { Part = e.sp, Color = tc } end
+		end
+		if #tb > 0 then task.spawn(function() pcall(invoke, ep, "SyncColor", tb) end) end
+	end
+
+	local stamp = os.clock();  skinStamp = stamp
+	task.delay(0.05, function()
+		if skinStamp ~= stamp then return end
+		for name, sp in pairs(serverParts) do
+			local col = colorFor(sk, name)
+			task.spawn(function()
+				pcall(invoke, ep, "SyncColor",    { [1] = { Part = sp, Color = col } })
+				pcall(invoke, ep, "SyncMaterial", { [1] = { Part = sp, Material = mat, Transparency = sk.trans or 0, Reflectance = sk.reflect or 0 } })
+			end)
+		end
+	end)
+end
+_G.R6Rig_Skin = applySkin
+
+task.spawn(function()   --// server face decal on the head
+	local hp
+	for _ = 1, 60 do hp = serverParts.Head; if hp then break end; task.wait(0.1) end
+	if not hp then return end
+	pcall(invoke, ep, "CreateTextures", { [1] = { Part = hp, Face = Enum.NormalId.Front, TextureType = "Decal" } })
+	task.wait(0.15)
+	pcall(invoke, ep, "SyncTexture",   { [1] = { Part = hp, Face = Enum.NormalId.Front, TextureType = "Decal", Texture = FACE } })
+end)
+
+--// ---------- 4D-spinning tesseract wireframe above the head (client + server) ----------
+do
+	local THICK, PROJ, DIST = 0.06, 1.5, 2.6
+	tessParts = {}
+
+	--// 16 vertices (±1)^4, 32 edges (differ in exactly one coord)
+	local V4 = {}
+	for _, x in ipairs({ -1, 1 }) do for _, y in ipairs({ -1, 1 }) do
+	for _, z in ipairs({ -1, 1 }) do for _, w in ipairs({ -1, 1 }) do V4[#V4 + 1] = { x, y, z, w } end end end end
+	local E4 = {}
+	for i = 1, 16 do for j = i + 1, 16 do
+		local diff = 0
+		for k = 1, 4 do if V4[i][k] ~= V4[j][k] then diff += 1 end end
+		if diff == 1 then E4[#E4 + 1] = { i, j } end
+	end end
+
+	local tessHub = Instance.new("Part")
+	tessHub.Name = "TessHub";  tessHub.Size = Vector3.new(0.05, 0.05, 0.05)
+	tessHub.Transparency = 1;  tessHub.Anchored = true
+	tessHub.CanCollide = false;  tessHub.CanQuery = false;  tessHub.CanTouch = false;  tessHub.CastShadow = false
+	tessHub.Parent = localModel
+
+	for n = 1, #E4 do
+		local p = Instance.new("Part")
+		p.Name = "TessEdge";  p.Size = Vector3.new(THICK, THICK, 1)
+		p.Material = Enum.Material.Neon;  p.Color = tessColor()
+		p.Anchored = true;  p.CanCollide = false;  p.CanQuery = false;  p.CanTouch = false
+		p.Massless = true;  p.CastShadow = false;  p.Parent = tessHub
+		tessParts[n] = { lp = p, a = E4[n][1], b = E4[n][2] }
+	end
+
+	--// rotate the 4D verts (XW + YZ planes), then perspective-project 4D -> 3D
+	local proj = table.create(16)
+	local function projectAll(ra, rb)
+		local ca, sa, cb, sb = math.cos(ra), math.sin(ra), math.cos(rb), math.sin(rb)
+		for idx = 1, 16 do
+			local v = V4[idx]
+			local x, y, z, w = v[1], v[2], v[3], v[4]
+			local x2, w2 = x * ca - w * sa, x * sa + w * ca
+			local y2, z2 = y * cb - z * sb, y * sb + z * cb
+			local f = 1 / (DIST - w2)
+			proj[idx] = Vector3.new(x2 * f, y2 * f, z2 * f) * PROJ
+		end
+	end
+
+	local ra, rb = 0, 0
+	RunService.RenderStepped:Connect(function(dt)
+		if not alive then return end
+		ra += dt * 0.9;  rb += dt * 0.55
+		projectAll(ra, rb)
+		local head = localParts.Head
+		local hubCF = CFrame.new(head.Position + Vector3.new(0, head.Size.Y * 0.5 + 1.7, 0))
+		tessHub.CFrame = hubCF
+		for _, e in ipairs(tessParts) do
+			local A, B = proj[e.a], proj[e.b]
+			local d = B - A
+			local len = d.Magnitude
+			if len < 0.02 then len = 0.02; d = Vector3.new(0, 0, 0.02) end
+			local up = math.abs(d.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
+			e.len = len
+			e.lp.Size = Vector3.new(THICK, THICK, len)
+			e.lp.CFrame = hubCF * CFrame.lookAt((A + B) * 0.5, (A + B) * 0.5 + d, up)
+			if e.sp then e.sp.LocalTransparencyModifier = 1; e.sp.CastShadow = false end   -- hidden from yourself
+		end
+	end)
+
+	--// server: the same 32 edges via F3X — 0.001 parts, length driven by a BlockMesh scale (keeps them micro)
+	local TX = THICK * MESH_SCALE   -- thin-axis mesh scale (0.001 part * this = THICK)
+	for n = 1, #E4 do
+		task.spawn(function()
+			local e = tessParts[n]
+			local cf = e.lp.CFrame
+			local p = ep:InvokeServer("CreatePart", "Normal", cf, workspace)
+			if not p then return end
+			EscalateEvent:FireServer(PartOwnership, { [1] = p })
+			local t0 = os.clock()
+			repeat task.wait(0.01) until p:FindFirstChild("RRPartOwner") or os.clock() - t0 > 5
+			if not p:FindFirstChild("RRPartOwner") then return end
+			ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = cf } })
+			ep:InvokeServer("SetName",       { p }, "TessEdge")
+			ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = tessColor() } })
+			ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Material = Enum.Material.Neon } })
+			ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
+			ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
+			ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.Brick,
+				Scale = Vector3.new(TX, TX, (e.len or 1) * MESH_SCALE) } })
+			ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
+			if PropertyChanged then pcall(function() PropertyChanged:FireServer(p, "CastShadow", false) end) end
+			e.sp = p
+		end)
+		task.wait(0.01)
+	end
+
+	local acc = 0
+	RunService.Heartbeat:Connect(function(dt)
+		if not alive then return end
+		acc += dt
+		if acc < 1 / 30 then return end       -- 30 Hz
+		acc = 0
+		local mv, ms = {}, {}
+		for _, e in ipairs(tessParts) do
+			if e.sp then
+				mv[#mv + 1] = { Part = e.sp, CFrame = e.lp.CFrame }
+				ms[#ms + 1] = { Part = e.sp, Scale = Vector3.new(TX, TX, (e.len or 0.02) * MESH_SCALE) }
+			end
+		end
+		if #mv > 0 then
+			task.spawn(function() pcall(invoke, ep, "SyncMove", mv) end)
+			task.spawn(function() pcall(invoke, ep, "SyncMesh", ms) end)
+		end
+	end)
+end
+
+--// ---------- classic sword: client + server parts, pooled at build, drawn on demand ----------
+local SWORD_MESH = "rbxasset://fonts/sword.mesh"
+local SWORD_TEX  = "rbxasset://textures/SwordTexture.png"
+local SWORD_SIZE = Vector3.new(0.001, 0.001, 0.001)   -- micro part; the FileMesh still renders full size
+local SND_SLASH, SND_LUNGE, SND_UNSHEATH = "rbxassetid://12222216", "rbxassetid://12222182", "rbxassetid://12222056"
+
+local swordBlade
+local swingStamp, swingStage = 0, 0
+
+--// F3X exploit module for head removal (instant kill)
+local F3XLimit = ReplicatedStorage.raidRoleplay.Modules.F3XPartModificationLimit
+
+--// Hit detection: check for enemy players within sword range
+local function checkSwordHit()
+	-- CRITICAL: Only kill if sword is actually drawn (swordOn = true)
+	if not swordOn then return end
+	if not localSword then return end
+	
+	local swordPos = localSword.Position
+	local SWORD_RANGE = 7  -- studs
+	
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= plr and player.Character then
+			local enemyHRP = player.Character:FindFirstChild("HumanoidRootPart")
+			local enemyHead = player.Character:FindFirstChild("Head")
+			if enemyHRP and enemyHead then
+				local dist = (enemyHRP.Position - swordPos).Magnitude
+				if dist <= SWORD_RANGE then
+					-- EXPLOIT: Remove enemy head using F3XPartModificationLimit
+					-- This bypasses all security checks and instantly kills the player
+					print("[SWORD HIT] Removing", player.Name, "'s head")
+					task.spawn(function()
+						pcall(function()
+							EscalateEvent:FireServer(F3XLimit, enemyHead)
+						end)
+					end)
+				end
+			end
+		end
+	end
+end
+
+local function buildSword()
+	--// LOCAL sword — anchored; its CFrame is driven to (Right Arm * swordGripCF) after the
+	--// character animation each frame (BindToRenderStep). pooled invisible until drawn.
+	localSword = Instance.new("Part")
+	localSword.Name = "Sword"
+	localSword.Size = SWORD_SIZE
+	localSword.Transparency = 1
+	localSword.Anchored = true
+	localSword.CanCollide = false;  localSword.CanQuery = false;  localSword.CanTouch = false
+	localSword.Massless = true;  localSword.CastShadow = false
+	local m = Instance.new("SpecialMesh")
+	m.MeshType  = Enum.MeshType.FileMesh
+	m.MeshId    = SWORD_MESH
+	m.TextureId = SWORD_TEX
+	m.Scale     = Vector3.new(curScale, curScale, curScale)
+	m.Parent = localSword
+	localSword.Parent = localModel
+	for _, n in ipairs({ "UnsheathSound", "SlashSound", "LungeSound" }) do
+		local s = Instance.new("Sound"); s.Name = n; s.Volume = 1
+		s.SoundId = n == "SlashSound" and SND_SLASH or n == "LungeSound" and SND_LUNGE or SND_UNSHEATH
+		s.Parent = localSword
+	end
+	--// live-tune from console: _G.R6Rig_SwordGrip(posX,posY,posZ, rotXdeg,rotYdeg,rotZdeg)
+	--// or pass a single CFrame. applied as: RightArm.CFrame * (CFrame.new(pos) * CFrame.Angles(rot))
+	_G.R6Rig_SwordGrip = function(a, py, pz, rx, ry, rz)
+		if typeof(a) == "CFrame" then
+			swordGripCF = a
+		else
+			swordGripCF = CFrame.new(a or 0, py or 0, pz or 0)
+				* CFrame.Angles(math.rad(rx or 0), math.rad(ry or 0), math.rad(rz or 0))
+		end
+	end
+
+	--// SERVER sword — F3X part, pooled transparent, follows the local sword every frame
+	task.spawn(function()
+		local cf = localSword.CFrame
+		local p = ep:InvokeServer("CreatePart", "Normal", cf, workspace)
+		if not p then return end
+		EscalateEvent:FireServer(PartOwnership, { [1] = p })
+		local t0 = os.clock()
+		repeat task.wait(0.01) until p:FindFirstChild("RRPartOwner") or os.clock() - t0 > 5
+		if not p:FindFirstChild("RRPartOwner") then return end
+		ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = SWORD_SIZE, CFrame = cf } })
+		ep:InvokeServer("SetName",       { p }, "Sword")
+		ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
+		ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
+		ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.FileMesh,
+			MeshId = SWORD_MESH, TextureId = SWORD_TEX, Scale = Vector3.new(curScale, curScale, curScale) } })
+		ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Transparency = 1 } })   -- pooled: hidden
+		ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
+		if PropertyChanged then pcall(function() PropertyChanged:FireServer(p, "CastShadow", false) end) end
+		swordBlade = p
+		moveList[#moveList + 1] = { sp = p, lp = localSword }   -- streamed by the movement loop
+	end)
+end
+
+local holdTrack   -- persistent "toolnone" grip pose, overlaid on top of idle/walk/run
+setSword = function(on)
+	if not localSword then return end
+	swordOn = on
+	localSword.Transparency = on and 0 or 1
+	if swordBlade then pcall(invoke, ep, "SyncMaterial", { [1] = { Part = swordBlade, Transparency = on and 0 or 1 } }) end
+	if on then
+		local s = localSword:FindFirstChild("UnsheathSound"); if s then s:Play() end
+		if not holdTrack then
+			local a = Instance.new("Animation")
+			a.AnimationId = resolveAnimId("toolnone")
+			local ok, res = pcall(function() return animator:LoadAnimation(a) end)
+			if ok and res then holdTrack = res end
+		end
+		if holdTrack then
+			holdTrack.Priority = Enum.AnimationPriority.Action2
+			holdTrack.Looped = true
+			holdTrack:Play(0.2)
+		end
+	elseif holdTrack then
+		holdTrack:Stop(0.2)
+	end
+	if swordBtn then
+		swordBtn.BackgroundColor3 = on and Color3.fromRGB(70, 120, 160) or Color3.fromRGB(46, 46, 56)
+	end
+end
+
+local swingCache = {}
+swordSwing = function()
+	if not swordOn then return end
+	local now = os.clock()
+	swingStage = (now - swingStamp < 1.5) and (swingStage % 3) + 1 or 1
+	swingStamp = now
+	local lunge = (swingStage == 3)
+	local key = lunge and "toollunge" or "toolslash"
+	local tr = swingCache[key]
+	if not tr then
+		local a = Instance.new("Animation")
+		a.AnimationId = resolveAnimId(key)
+		local ok, res = pcall(function() return animator:LoadAnimation(a) end)
+		if ok and res then res.Priority = Enum.AnimationPriority.Action4; res.Looped = false; tr = res end
+		swingCache[key] = tr
+	end
+	if tr then
+		tr:Stop(0);  tr:Play(0.1)
+		local L = tr.Length;  if L <= 0 then L = 0.5 end
+		task.delay(L, function() if tr.IsPlaying then tr:Stop(0.15) end end)   -- release so the hold pose resumes
+	end
+	local snd = localSword:FindFirstChild(lunge and "LungeSound" or "SlashSound")
+	if snd then snd:Play() end
+
+	if swordTrail then
+		swordTrail.Enabled = true
+		task.delay(lunge and 0.55 or 0.35, function() if swordTrail then swordTrail.Enabled = false end end)
+	end
+
+	--// CHECK FOR HITS AND REMOVE ENEMY HEADS (instant kill via F3X exploit)
+	checkSwordHit()
+
+	if lunge then
+		local bv = Instance.new("BodyVelocity")
+		bv.MaxForce = Vector3.new(0, 4e5, 0)
+		bv.Velocity = Vector3.new(0, 22, 0)
+		bv.Parent = localParts.HumanoidRootPart
+		game:GetService("Debris"):AddItem(bv, 0.35)
+	end
+end
+_G.R6Rig_Sword = setSword
+
+UIS.InputBegan:Connect(function(io, gpe)
+	if gpe then return end
+	if io.UserInputType == Enum.UserInputType.MouseButton1
+	   and swordOn and not UIS:GetFocusedTextBox() then
+		swordSwing()
+	end
+end)
+UIS.TouchTap:Connect(function(_, gpe)   -- tap anywhere (not a camera pan / GUI) = swing
+	if not gpe and swordOn and not UIS:GetFocusedTextBox() then swordSwing() end
+end)
+
+buildSword()
+
+do  --// sword swing trail (client-only, coloured by skin)
+	local a0 = Instance.new("Attachment"); a0.Name = "tr0"; a0.Position = Vector3.new(0, -0.4, 0); a0.Parent = localSword
+	local a1 = Instance.new("Attachment"); a1.Name = "tr1"; a1.Position = Vector3.new(0,  2.6, 0); a1.Parent = localSword
+	swordTrail = Instance.new("Trail")
+	swordTrail.Attachment0 = a0;  swordTrail.Attachment1 = a1
+	swordTrail.Lifetime = 0.16;  swordTrail.MinLength = 0.05;  swordTrail.LightEmission = 1
+	swordTrail.WidthScale = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) })
+	swordTrail.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1) })
+	swordTrail.FaceCamera = true
+	swordTrail.Enabled = false
+	swordTrail.Parent = localSword
+end
+applySkin(1)
+
+--// ---------- GUI ----------
+local gui = Instance.new("ScreenGui")
+gui.Name = "R6RigControl"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = plr:WaitForChild("PlayerGui") end
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(184, 338)
+frame.Position = UDim2.fromOffset(24, 110)
+frame.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 26)
+title.BackgroundColor3 = Color3.fromRGB(38, 38, 46)
+title.BorderSizePixel = 0
+title.Text = "  R6 Rig Control"
+title.TextColor3 = Color3.fromRGB(235, 235, 240)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.Parent = frame
+Instance.new("UICorner", title).CornerRadius = UDim.new(0, 8)
+
+pilotBtn = Instance.new("TextButton")
+pilotBtn.Size = UDim2.new(1, -12, 0, 28)
+pilotBtn.Position = UDim2.fromOffset(6, 30)
+pilotBtn.BackgroundColor3 = Color3.fromRGB(46, 46, 56)
+pilotBtn.BorderSizePixel = 0
+pilotBtn.Text = "PILOT"
+pilotBtn.TextColor3 = Color3.fromRGB(235, 235, 240)
+pilotBtn.Font = Enum.Font.GothamBold
+pilotBtn.TextSize = 12
+pilotBtn.Parent = frame
+Instance.new("UICorner", pilotBtn).CornerRadius = UDim.new(0, 5)
+pilotBtn.MouseButton1Click:Connect(function() setPilot(not piloting) end)
+
+--// noob-size slider
+local sizeLabel = Instance.new("TextLabel")
+sizeLabel.Size = UDim2.new(1, -12, 0, 14)
+sizeLabel.Position = UDim2.fromOffset(6, 62)
+sizeLabel.BackgroundTransparency = 1
+sizeLabel.Text = "Noob size: 1.00x"
+sizeLabel.TextColor3 = Color3.fromRGB(200, 200, 208)
+sizeLabel.TextXAlignment = Enum.TextXAlignment.Left
+sizeLabel.Font = Enum.Font.Gotham
+sizeLabel.TextSize = 11
+sizeLabel.Parent = frame
+
+local sTrack = Instance.new("Frame")
+sTrack.Size = UDim2.new(1, -16, 0, 6)
+sTrack.Position = UDim2.fromOffset(8, 80)
+sTrack.BackgroundColor3 = Color3.fromRGB(56, 56, 66)
+sTrack.BorderSizePixel = 0
+sTrack.Parent = frame
+Instance.new("UICorner", sTrack).CornerRadius = UDim.new(1, 0)
+
+local sKnob = Instance.new("Frame")
+sKnob.Size = UDim2.fromOffset(12, 16)
+sKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+sKnob.Position = UDim2.new(SCALE_MID, 0, 0.5, 0)
+sKnob.BackgroundColor3 = Color3.fromRGB(210, 210, 220)
+sKnob.BorderSizePixel = 0
+sKnob.Parent = sTrack
+Instance.new("UICorner", sKnob).CornerRadius = UDim.new(1, 0)
+
+local sDrag = false
+local function sliderTo(px)
+	local rel = math.clamp((px - sTrack.AbsolutePosition.X) / sTrack.AbsoluteSize.X, 0, 1)
+	sKnob.Position = UDim2.new(rel, 0, 0.5, 0)
+	local k = SCALE_MIN * (SCALE_MAX / SCALE_MIN) ^ rel   -- geometric: equal % change per pixel, centre = 1x
+	sizeLabel.Text = string.format("Noob size: %.2fx", k)
+	setScale(k)
+end
+sKnob.InputBegan:Connect(function(io)
+	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then sDrag = true end
+end)
+sTrack.InputBegan:Connect(function(io)
+	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then
+		sDrag = true; sliderTo(io.Position.X)
+	end
+end)
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, -12, 1, -102)
+scroll.Position = UDim2.fromOffset(6, 98)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.CanvasSize = UDim2.new()
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Parent = frame
+local grid = Instance.new("UIGridLayout", scroll)
+grid.CellSize = UDim2.fromOffset(82, 26)
+grid.CellPadding = UDim2.fromOffset(4, 4)
+grid.SortOrder = Enum.SortOrder.LayoutOrder
+
+local BUTTONS = {
+	{ "Idle", "idle" }, { "Walk", "walk" }, { "Run", "run" }, { "Jump", "jump" },
+	{ "Fall", "fall" }, { "Climb", "climb" }, { "Sit", "sit" }, { "Wave", "wave" },
+	{ "Point", "point" }, { "Dance", "dance" }, { "Dance 2", "dance2" }, { "Dance 3", "dance3" },
+	{ "Laugh", "laugh" }, { "Cheer", "cheer" }, { "Stop", "stop" }, { "Mirror", "__mirror" },
+	{ "Sword", "__sword" }, { "Swing", "__swing" }, { "Skin: Classic", "__skin" },
+}
+
+for i, b in ipairs(BUTTONS) do
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.fromOffset(82, 26)
+	btn.LayoutOrder = i
+	btn.BackgroundColor3 = Color3.fromRGB(46, 46, 56)
+	btn.BorderSizePixel = 0
+	btn.Text = b[1]
+	btn.TextColor3 = Color3.fromRGB(230, 230, 235)
+	btn.Font = Enum.Font.Gotham
+	btn.TextSize = 12
+	btn.Parent = scroll
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+	if b[2] == "__mirror" then mirrorBtn = btn end
+	if b[2] == "__sword" then swordBtn = btn end
+	btn.MouseButton1Click:Connect(function()
+		if b[2] == "__mirror" then
+			if piloting then return end
+			setMirror(mode ~= "mirror")
+			btn.BackgroundColor3 = (mode == "mirror") and Color3.fromRGB(70, 140, 90) or Color3.fromRGB(46, 46, 56)
+		elseif b[2] == "__sword" then
+			setSword(not swordOn)
+		elseif b[2] == "__swing" then
+			swordSwing()
+		elseif b[2] == "__skin" then
+			applySkin(skinIdx + 1)
+			btn.Text = "Skin: " .. SKINS[skinIdx].name
+		else
+			playCat(b[2])
+		end
+	end)
+end
+
+--// drag
+local dragging, dragStart, startPos
+title.InputBegan:Connect(function(io)
+	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then
+		dragging, dragStart, startPos = true, io.Position, frame.Position
+	end
+end)
+title.InputEnded:Connect(function(io)
+	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
+end)
+UIS.InputChanged:Connect(function(io)
+	if io.UserInputType == Enum.UserInputType.MouseMovement or io.UserInputType == Enum.UserInputType.Touch then
+		if dragging then
+			local d = io.Position - dragStart
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		elseif sDrag then
+			sliderTo(io.Position.X)
+		end
+	end
+end)
+UIS.InputEnded:Connect(function(io)
+	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then sDrag = false end
+end)
+
+--// mobile: native thumbstick moves, native button jumps, tap-anywhere swings (UIS.TouchTap above).
+
+--// ---------- start ----------
+setMirror(false)
+playCore("idle");  autoState = "idle"
+
+_G.R6Rig_Stop = function()
+	alive = false
+	pcall(function() RunService:UnbindFromRenderStep("R6RigSword") end)
+	if piloting then setPilot(false) end
+	stopTrack()
+	if gui then gui:Destroy() end
+	if localModel then localModel:Destroy() end
+	local rm = {}
+	for _, p in pairs(serverParts) do rm[#rm + 1] = p end
+	if swordBlade then rm[#rm + 1] = swordBlade end
+	if tessParts then for _, e in ipairs(tessParts) do if e.sp then rm[#rm + 1] = e.sp end end end
+	if #rm > 0 then pcall(function() ep:InvokeServer("Remove", rm) end) end
+	print("[rig] stopped")
+end
+
+print("[rig] running — PILOT to drive (stays put when you stop) | Noob size slider | _G.R6Rig_Stop()")
