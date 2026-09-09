@@ -1260,60 +1260,76 @@ do
 	end
 	RunService.RenderStepped:Connect(function(dt) if alive then frame(dt) end end)
 
-	--// server: body + femur + tibia per leg. IK keeps segments a fixed length -> SyncMove only.
-	local sBody
-	local sSeg = {}
+	--// full server mirror: every visible local spider part gets a 0.001 twin, streamed each tick.
+	local SRATE   = 26          -- server update Hz (drop if it strains the server)
+	local SMIRROR = {}          -- { { sp = serverPart, lp = localPart } }
+	local spiderPushLook       -- (re)sends per-part colour/material/transparency to the server
 	local function claim(p)
 		EscalateEvent:FireServer(PartOwnership, { [1] = p })
 		local t0 = os.clock()
 		repeat task.wait(0.01) until p:FindFirstChild("RRPartOwner") or os.clock() - t0 > 5
 		return p:FindFirstChild("RRPartOwner") ~= nil
 	end
-	local function mkServer(name, scale)
-		local cf = CFrame.new(0, -500, 0)
-		local p = ep:InvokeServer("CreatePart", "Normal", cf, workspace)
-		if not (p and claim(p)) then return nil end
+	local function twin(lp)
+		local ball = (lp.Shape == Enum.PartType.Ball)
+		local cf = CFrame.new(0, -400, 0)
+		local p = ep:InvokeServer("CreatePart", ball and "Ball" or "Normal", cf, workspace)
+		if not (p and claim(p)) then return end
 		ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = cf } })
-		ep:InvokeServer("SetName",       { p }, name)
-		ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = GUN } })
+		ep:InvokeServer("SetName",       { p }, "Sp")
+		ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = lp.Color } })
 		ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
 		ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
-		ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.Brick, Scale = scale } })
-		ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Material = Enum.Material.Metal, Transparency = 1 } })
+		ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = ball and Enum.MeshType.Sphere or Enum.MeshType.Brick,
+			Scale = lp.Size * MESH_SCALE } })
+		ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Material = lp.Material, Transparency = lp.Transparency } })
 		ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
-		castShadowOff(p)
-		p.CanQuery = false
+		castShadowOff(p);  p.CanQuery = false
 		spiderServer[#spiderServer + 1] = p
-		return p
+		SMIRROR[#SMIRROR + 1] = { sp = p, lp = lp }
+	end
+
+	local mirrorList = { body, hull, core, under, eye, mand1, mand2, abdo }
+	for _, k in ipairs(spikes) do mirrorList[#mirrorList + 1] = k end
+	for _, l in ipairs(legs) do
+		for _, nm in ipairs({ "coxa","femur","tibia","tip","jHip","jKnee",
+		                      "mBarrel","mRod","mHipBox","mKneeBox","mPlate","mHipRing","mKneeRing" }) do
+			mirrorList[#mirrorList + 1] = l[nm]
+		end
 	end
 	task.spawn(function()
-		local sp = CFG.SP
-		sBody = mkServer("SpiderBody", Vector3.new(4.6*sp*MESH_SCALE, 1.5*sp*MESH_SCALE, 5.6*sp*MESH_SCALE))
+		for _, lp in ipairs(mirrorList) do twin(lp);  task.wait(0.03) end
+		print("[spider] server mirror:", #SMIRROR, "/", #mirrorList)
 	end)
-	for i = 1, NLEG do
+
+	--// push per-part colour / material / transparency to the server (skin change / toggle)
+	spiderPushLook = function()
 		task.spawn(function()
-			local sp = CFG.SP
-			local fw = CFG.W * sp * MESH_SCALE
-			local f = mkServer("SpiderLeg", Vector3.new(fw, fw, CFG.FEMUR * sp * MESH_SCALE))
-			local t = mkServer("SpiderLeg", Vector3.new(fw * 0.82, fw * 0.82, CFG.TIBIA * sp * MESH_SCALE))
-			if f then sSeg[#sSeg + 1] = { part = f, i = i, k = "f" } end
-			if t then sSeg[#sSeg + 1] = { part = t, i = i, k = "t" } end
+			local mat = {}
+			for _, m in ipairs(SMIRROR) do
+				mat[#mat + 1] = { Part = m.sp, Material = m.lp.Material, Transparency = m.lp.Transparency }
+			end
+			if #mat > 0 then pcall(invoke, ep, "SyncMaterial", mat) end
+			local col = {}
+			for _, m in ipairs(SMIRROR) do col[#col + 1] = { Part = m.sp, Color = m.lp.Color } end
+			if #col > 0 then pcall(invoke, ep, "SyncColor", col) end
 		end)
-		task.wait(0.03)
 	end
 
 	local acc = 0
 	RunService.Heartbeat:Connect(function(dt)
 		if not alive or not spiderOn then return end
-		acc += dt;  if acc < 1 / 30 then return end;  acc = 0
-		local mv = {}
-		if sBody then mv[#mv + 1] = { Part = sBody, CFrame = body.CFrame };  sBody.LocalTransparencyModifier = 1;  sBody.CastShadow = false end
-		for _, s in ipairs(sSeg) do
-			local part = (s.k == "f") and legs[s.i].femur or legs[s.i].tibia
-			mv[#mv + 1] = { Part = s.part, CFrame = part.CFrame }
-			s.part.LocalTransparencyModifier = 1;  s.part.CastShadow = false
+		acc += dt;  if acc < 1 / SRATE then return end;  acc = 0
+		local mv, ms = {}, {}
+		for _, m in ipairs(SMIRROR) do
+			mv[#mv + 1] = { Part = m.sp, CFrame = m.lp.CFrame }
+			ms[#ms + 1] = { Part = m.sp, Scale = m.lp.Size * MESH_SCALE }
+			m.sp.LocalTransparencyModifier = 1;  m.sp.CastShadow = false
 		end
-		if #mv > 0 then task.spawn(function() pcall(invoke, ep, "SyncMove", mv) end) end
+		if #mv > 0 then
+			task.spawn(function() pcall(invoke, ep, "SyncMove", mv) end)
+			task.spawn(function() pcall(invoke, ep, "SyncMesh", ms) end)
+		end
 	end)
 
 	--// ---- Special Skins: not just colours — proportions, gait, materials, decorations ----
@@ -1434,21 +1450,7 @@ do
 			particle.Enabled = false
 		end
 
-		task.spawn(function()
-			local mesh, mat = {}, {}
-			if sBody then
-				mesh[#mesh+1] = { Part = sBody, Scale = S.bsz * sp * MESH_SCALE }
-				mat[#mat+1]   = { Part = sBody, Color = S.col }
-			end
-			for _, s in ipairs(sSeg) do
-				local w = S.w * sp * MESH_SCALE
-				local len = ((s.k == "f") and S.fem or S.tib) * sp * MESH_SCALE
-				mesh[#mesh+1] = { Part = s.part, Scale = Vector3.new(w, w, len) }
-				mat[#mat+1]   = { Part = s.part, Color = S.col }
-			end
-			if #mesh > 0 then pcall(invoke, ep, "SyncMesh", mesh) end
-			if #mat > 0 then pcall(invoke, ep, "SyncColor", mat) end
-		end)
+		if spiderPushLook then spiderPushLook() end   -- server twins pick up the new look
 
 		if ssBtn then ssBtn.Text = "SSkin: " .. S.name end
 	end
@@ -1465,13 +1467,11 @@ do
 		for _, n in ipairs(R6) do localParts[n].Transparency = on and 1 or (SKINS[skinIdx].trans or 0) end
 		local fd = localParts.Head:FindFirstChild("face");  if fd then fd.Transparency = on and 1 or 0 end
 		if on and swordOn and setSword then setSword(false) end
-		applySSkin(ssIdx)   -- sizes + colours + shows/hides all spider + decoration parts
-		task.spawn(function()
-			local a, b = {}, {}
+		applySSkin(ssIdx)   -- sizes + colours + per-part visibility (local + pushes to server twins)
+		task.spawn(function()   -- the R6 body parts: hide while the spider is out
+			local a = {}
 			for _, sp in pairs(serverParts) do a[#a + 1] = { Part = sp, Transparency = on and 1 or (SKINS[skinIdx].trans or 0) } end
-			for _, p in ipairs(spiderServer) do b[#b + 1] = { Part = p, Transparency = on and (SSKINS[ssIdx].trans or 0) or 1 } end
 			if #a > 0 then pcall(invoke, ep, "SyncMaterial", a) end
-			if #b > 0 then pcall(invoke, ep, "SyncMaterial", b) end
 		end)
 		if spiderBtn then
 			spiderBtn.Text = on and "Spider: On" or "Spider: Off"
