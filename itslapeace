@@ -1,4 +1,4 @@
---// R6 Rig — drivable local puppet + server copy streamed via SyncMove
+--// R6 Rig - drivable local puppet + server copy streamed via SyncMove
 --//
 --//  local  : real R6 rig (Motor6D joints + Humanoid + Animator), client-only.
 --//  server : 6 F3X parts (CreatePart -> EscalateEvent claim -> props), anchored.
@@ -6,10 +6,10 @@
 --//           batched SyncMove, fire-and-forget (never waits on the reply).
 --//
 --//  IDLE mode  : rig stands beside you, GUI plays emotes, "Mirror" copies your pose.
---//  PILOT mode : YOU drive the rig — WASD walk, Shift run, Space jump, camera follows,
+--//  PILOT mode : YOU drive the rig - WASD walk, Shift run, Space jump, camera follows,
 --//               animations auto-play from Humanoid state. Your real char is frozen.
 --//
---//  (F3X spawns BaseParts only, so the server rig has no Humanoid — it just follows
+--//  (F3X spawns BaseParts only, so the server rig has no Humanoid - it just follows
 --//   the local rig's pose frame by frame.)
 
 local Players           = game:GetService("Players")
@@ -216,7 +216,7 @@ do
 						ep:InvokeServer("SyncMaterial",  { [1] = { Part = part, Material = Enum.Material.Plastic, Transparency = s.transparency or 0 } })
 						ep:InvokeServer("SyncCollision", { [1] = { Part = part, CanCollide = false } })
 						ep:InvokeServer("CreateMeshes",  { [1] = { Part = part } })
-						--// FileMesh Scale is ABSOLUTE (not part-relative like BlockMesh) — no 1/MICRO multiplier.
+						--// FileMesh Scale is ABSOLUTE (not part-relative like BlockMesh) - no 1/MICRO multiplier.
 						local meshId = (s.name == "Head") and HEAD_MESH or BODY_MESH[s.name]
 						local ms = (s.name == "Head") and HEAD_MESH_SCALE or BODY_MESH_SCALE
 						if meshId then
@@ -263,6 +263,7 @@ local setSpy              -- defined after the sword/tesseract are built
 local mobileJumpGui       -- touch JUMP button (the native one hides when we zero the real char's jump)
 local spiderOn = false
 local setSpider           -- swap the R6 rig for a procedural spider (defined after everything is built)
+local spiderRecolor       -- recolour spider neon accents to the current skin
 local spiderServer = {}   -- server-side spider parts, for cleanup
 local currentTrack, autoState
 local trackCache = {}
@@ -610,6 +611,7 @@ local function applySkin(i)
 		end
 		if #tb > 0 then task.spawn(function() pcall(invoke, ep, "SyncColor", tb) end) end
 	end
+	if spiderRecolor then spiderRecolor() end
 
 	local stamp = os.clock();  skinStamp = stamp
 	task.delay(0.05, function()
@@ -640,7 +642,7 @@ do
 	local THICK, PROJ, DIST = 0.06, 1.5, 2.6
 	tessParts = {}
 
-	--// 16 vertices (±1)^4, 32 edges (differ in exactly one coord)
+	--// 16 vertices (Â±1)^4, 32 edges (differ in exactly one coord)
 	local V4 = {}
 	for _, x in ipairs({ -1, 1 }) do for _, y in ipairs({ -1, 1 }) do
 	for _, z in ipairs({ -1, 1 }) do for _, w in ipairs({ -1, 1 }) do V4[#V4 + 1] = { x, y, z, w } end end end end
@@ -702,7 +704,7 @@ do
 		end
 	end)
 
-	--// server: the same 32 edges via F3X — 0.001 parts, length driven by a BlockMesh scale (keeps them micro)
+	--// server: the same 32 edges via F3X - 0.001 parts, length driven by a BlockMesh scale (keeps them micro)
 	local TX = THICK * MESH_SCALE   -- thin-axis mesh scale (0.001 part * this = THICK)
 	for n = 1, #E4 do
 		task.spawn(function()
@@ -792,7 +794,7 @@ local function checkSwordHit()
 end
 
 local function buildSword()
-	--// LOCAL sword — anchored; its CFrame is driven to (Right Arm * swordGripCF) after the
+	--// LOCAL sword - anchored; its CFrame is driven to (Right Arm * swordGripCF) after the
 	--// character animation each frame (BindToRenderStep). pooled invisible until drawn.
 	localSword = Instance.new("Part")
 	localSword.Name = "Sword"
@@ -824,7 +826,7 @@ local function buildSword()
 		end
 	end
 
-	--// SERVER sword — F3X part, pooled transparent, follows the local sword every frame
+	--// SERVER sword - F3X part, pooled transparent, follows the local sword every frame
 	task.spawn(function()
 		local cf = localSword.CFrame
 		local p = ep:InvokeServer("CreatePart", "Normal", cf, workspace)
@@ -983,190 +985,493 @@ setSpy = function(lvl)
 end
 _G.R6Rig_Spy = setSpy
 
---// ---------- SPIDER MODE ----------
---// swaps the visible R6 rig for a procedural 8-leg spider that walks itself.
---// the invisible HumanoidRootPart still does the moving (pilot / idle), the body rides it,
---// the legs plant on the ground and step as it goes. client + server.
+--// ---------- SPIDER MODE - mechanical 8-leg walker (3-segment IK legs, tetrapod gait) ----------
+--// the invisible HumanoidRootPart does the moving; the body rides it; legs plant + step in a wave.
 do
-	local ANG      = { 42, 74, 106, 138, -42, -74, -106, -138 }   -- leg splay, degrees from forward
-	local BODY_H   = 1.8      -- body height above ground
-	local REACH    = 4.2      -- foot distance from body
-	local SHRUG    = 1.25     -- shoulder height above body centre
-	local STEP_D   = 1.8      -- overreach that triggers a step
-	local STEP_T   = 0.13     -- seconds per step
-	local STEP_LIFT= 0.9
-	local KNEE_UP  = 1.4
-	local THK      = 0.22
-	local DARK     = Color3.fromRGB(20, 20, 26)
+	local NLEG   = 8
+	local PHASE  = { 0, 0.5, 0.5, 0, 0.5, 0, 0, 0.5 }    -- tetrapod: diagonal legs anti-phase
+	local GUN, DKR = Color3.fromRGB(32, 35, 43), Color3.fromRGB(19, 21, 27)
+	local function glow() return SKINS[skinIdx].glow or Color3.fromRGB(90, 210, 255) end
 
-	local rp = RaycastParams.new()
-	rp.FilterType = Enum.RaycastFilterType.Exclude
-	local function groundY(x, z, fb)
-		--// exclude our own parts — the server copies sit right under the ray and would make it climb
+	--// live config — Special Skins overwrite these
+	local CFG = {
+		SP = 1.4, W = 0.42, FEMUR = 3.8, TIBIA = 5.0, REACH = 7.2, BODY_H = 3.6,
+		HIP_R = 2.0, HIP_UP = 0.2, SHO_OUT = 1.9, SHO_UP = 2.1,
+		SWING = 0.42, LIFT = 1.9, LEAD = 0.16, GRATE = 0.09, GBOB = 0.12,
+		ANG = { 34, 66, 114, 146, -34, -66, -114, -146 },
+	}
+
+	local rigM = Instance.new("Model");  rigM.Name = "Spider";  rigM.Parent = localModel
+	local accents = {}
+	local function mk(mat, col, ball, isAccent)
+		local p = Instance.new("Part")
+		p.Size = Vector3.one;  p.Material = mat;  p.Color = col
+		p.Anchored = true;  p.CanCollide = false;  p.CanQuery = false;  p.CanTouch = false
+		p.Massless = true;  p.CastShadow = false;  p.Transparency = 1
+		if ball then p.Shape = Enum.PartType.Ball end
+		p.Parent = rigM
+		if isAccent then accents[#accents + 1] = p end
+		return p
+	end
+
+	--// body cluster
+	local body  = mk(Enum.Material.DiamondPlate, GUN)
+	local hull  = mk(Enum.Material.Metal, GUN, true)
+	local core  = mk(Enum.Material.Neon, glow(), false, true)
+	local under = mk(Enum.Material.Neon, glow(), false, true)
+	local eye   = mk(Enum.Material.Neon, glow(), true, true)
+	local mand1 = mk(Enum.Material.Metal, DKR)
+	local mand2 = mk(Enum.Material.Metal, DKR)
+	local abdo  = mk(Enum.Material.SmoothPlastic, DKR, true)   -- rear abdomen bulb (some SSkins)
+	local spikes = {};  for s = 1, 8 do spikes[s] = mk(Enum.Material.Metal, DKR) end
+
+	--// signature particle on the body
+	local pAtt = Instance.new("Attachment");  pAtt.Parent = body
+	local particle = Instance.new("ParticleEmitter")
+	particle.Enabled = false;  particle.Rate = 22;  particle.Lifetime = NumberRange.new(0.5, 1.2)
+	particle.Speed = NumberRange.new(1, 3);  particle.SpreadAngle = Vector2.new(45, 45)
+	particle.LightEmission = 0.85
+	particle.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.55), NumberSequenceKeypoint.new(1, 0) })
+	particle.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.15), NumberSequenceKeypoint.new(1, 1) })
+	particle.Parent = pAtt
+
+	--// legs (sized/coloured by applySSkin). k* parts are the Klann linkage (Max Mechanical SSkin only)
+	local legs = {}
+	for i = 1, NLEG do
+		legs[i] = {
+			out = Vector3.zero, hipL = Vector3.zero, shoL = Vector3.zero,
+			anchor = Vector3.zero, foot = Vector3.zero, swingFrom = nil, planted = true, swingTo = nil,
+			coxa  = mk(Enum.Material.Metal, GUN),
+			femur = mk(Enum.Material.DiamondPlate, GUN),
+			tibia = mk(Enum.Material.Metal, GUN),
+			tip   = mk(Enum.Material.Neon, glow(), false, true),
+			jHip  = mk(Enum.Material.Neon, glow(), true, true),
+			jKnee = mk(Enum.Material.Neon, glow(), true, true),
+			mBarrel = mk(Enum.Material.Metal, GUN),        mRod  = mk(Enum.Material.Metal, GUN),
+			mHipBox = mk(Enum.Material.DiamondPlate, GUN), mKneeBox = mk(Enum.Material.DiamondPlate, GUN),
+			mPlate  = mk(Enum.Material.DiamondPlate, GUN), mHipRing = mk(Enum.Material.Neon, glow(), false, true),
+			mKneeRing = mk(Enum.Material.Neon, glow(), false, true),
+		}
+	end
+
+	local function seg(part, a, b, thick)
+		local d = b - a
+		local len = math.max(d.Magnitude, 0.05)
+		local up = math.abs(d.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
+		part.Size = Vector3.new(thick, thick, len)
+		part.CFrame = CFrame.lookAt((a + b) * 0.5, b, up)
+	end
+
+	--// place a box so its local Z axis spans a->b
+	local function bar(part, a, b, tx, ty)
+		local d = b - a
+		local len = math.max(d.Magnitude, 0.02)
+		local up = math.abs(d.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
+		part.Size = Vector3.new(tx, ty or tx, len)
+		part.CFrame = CFrame.lookAt((a + b) * 0.5, b, up)
+	end
+	local function ik(root, target, l1, l2, pole)
+		local toT = target - root
+		if toT.Magnitude < 1e-3 then return root + Vector3.new(0, -l1, 0) end
+		local dist = math.clamp(toT.Magnitude, math.abs(l1 - l2) + 0.05, l1 + l2 - 0.05)
+		local dir = toT.Unit
+		local cosA = math.clamp((l1*l1 + dist*dist - l2*l2) / (2 * l1 * dist), -1, 1)
+		local right = dir:Cross(pole)
+		if right.Magnitude < 1e-3 then right = dir:Cross(Vector3.new(0, 1, 0)) end
+		right = right.Unit
+		local up = right:Cross(dir).Unit
+		return root + (dir * cosA + up * math.sqrt(math.max(0, 1 - cosA*cosA))) * l1
+	end
+
+	local rp = RaycastParams.new();  rp.FilterType = Enum.RaycastFilterType.Exclude
+	local function cast(o, d)
 		local ex = { localModel, plr.Character }
 		for _, p in ipairs(spiderServer) do ex[#ex + 1] = p end
 		for _, p in pairs(serverParts) do ex[#ex + 1] = p end
 		if swordBlade then ex[#ex + 1] = swordBlade end
 		if tessParts then for _, e in ipairs(tessParts) do if e.sp then ex[#ex + 1] = e.sp end end end
 		rp.FilterDescendantsInstances = ex
-		local hit = workspace:Raycast(Vector3.new(x, fb + 40, z), Vector3.new(0, -300, 0), rp)
-		return hit and hit.Position.Y or fb
-	end
-	local function place(part, a, b)
-		local d = b - a
-		local len = math.max(d.Magnitude, 0.05)
-		local up = math.abs(d.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
-		part.Size = Vector3.new(THK, THK, len)
-		part.CFrame = CFrame.lookAt((a + b) * 0.5, b, up)
+		return workspace:Raycast(o, d, rp)
 	end
 
-	--// local spider
-	local body = Instance.new("Part")
-	body.Name = "SpiderBody";  body.Shape = Enum.PartType.Ball;  body.Size = Vector3.new(2.4, 1.7, 3.1)
-	body.Material = Enum.Material.SmoothPlastic;  body.Color = DARK;  body.Anchored = true
-	body.CanCollide = false;  body.CanQuery = false;  body.CanTouch = false
-	body.CastShadow = false;  body.Transparency = 1;  body.Parent = localModel
+	--// wall climbing state
+	local climbing, surfN, spos = false, Vector3.new(0, 1, 0), nil
+	local jumpReq = false
+	UIS.JumpRequest:Connect(function()
+		if spiderOn and climbing and not UIS:GetFocusedTextBox() then jumpReq = true end
+	end)
 
-	local legs = {}
-	for i = 1, 8 do
-		local a = math.rad(ANG[i])
-		local u = Instance.new("Part")
-		u.Name = "SpiderLeg";  u.Size = Vector3.new(THK, THK, 1);  u.Material = Enum.Material.SmoothPlastic
-		u.Color = DARK;  u.Anchored = true;  u.CanCollide = false;  u.CanQuery = false;  u.CanTouch = false
-		u.Massless = true;  u.CastShadow = false;  u.Transparency = 1;  u.Parent = body
-		local lo = u:Clone();  lo.Parent = body
-		legs[i] = {
-			shoulder = Vector3.new(math.sin(a) * 1.1, SHRUG, math.cos(a) * 1.1),
-			rest     = Vector3.new(math.sin(a) * REACH, 0, math.cos(a) * REACH),
-			foot = Vector3.zero, stepT = nil, from = Vector3.zero, to = Vector3.zero,
-			u = u, lo = lo,
-		}
-	end
-
-	local lastBody, stepping = Vector3.zero, 0
+	local gait, lastP, bob = 0, nil, 0
 	local function frame(dt)
-		if not spiderOn then return end
+		if not spiderOn then
+			if climbing then climbing = false;  hum.PlatformStand = false end
+			return
+		end
+		local SP     = CFG.SP
+		local W      = CFG.W * SP
+		local FEMUR  = CFG.FEMUR * SP
+		local TIBIA  = CFG.TIBIA * SP
+		local REACH  = CFG.REACH * SP
+		local BODY_H = CFG.BODY_H * SP
+		local SWING  = CFG.SWING
+		local LIFT   = CFG.LIFT * SP
+		local LEAD   = CFG.LEAD
+		local WALL_SEEK, CLIMB_SPD = 4.5 * SP, 17 * SP
 		local hrp = localParts.HumanoidRootPart
-		local gy = groundY(hrp.Position.X, hrp.Position.Z, hrp.Position.Y - 3)
+		local mv = (playerControls and playerControls:GetMoveVector()) or Vector3.new()
+		local inMag = Vector3.new(mv.X, 0, mv.Z).Magnitude
 		local look = hrp.CFrame.LookVector
 		local flat = Vector3.new(look.X, 0, look.Z)
-		if flat.Magnitude < 1e-3 then flat = Vector3.new(0, 0, -1) end
-		local airborne = (hrp.Position.Y - gy) > 5.5
-		local bpos = Vector3.new(hrp.Position.X, airborne and (hrp.Position.Y - 2.5) or (gy + BODY_H), hrp.Position.Z)
-		local bcf = CFrame.lookAt(bpos, bpos + flat)
-		local vel = (bpos - lastBody) / math.max(dt, 1e-3);  lastBody = bpos
-		body.CFrame = bcf * CFrame.Angles(math.rad(math.clamp(vel.Magnitude * 0.6, 0, 12)), 0, 0)  -- lean
+		flat = (flat.Magnitude < 1e-3) and Vector3.new(0, 0, -1) or flat.Unit
+		local gy = hrp.Position.Y - 3
 
-		for _, l in ipairs(legs) do
-			local restW = bcf * l.rest
-			restW = Vector3.new(restW.X, groundY(restW.X, restW.Z, restW.Y), restW.Z)
-			if l.foot == Vector3.zero then l.foot = restW end
-			if not l.stepT and stepping < 4 and (l.foot - restW).Magnitude > STEP_D then
-				l.stepT, l.from = 0, l.foot
-				l.to = restW + Vector3.new(vel.X, 0, vel.Z) * 0.12
-				stepping += 1
+		--// ---------- surface / climb ----------
+		if climbing and not piloting then climbing = false;  hum.PlatformStand = false end
+		if not climbing then
+			spos = Vector3.new(hrp.Position.X, gy + BODY_H, hrp.Position.Z)
+			surfN = surfN:Lerp(Vector3.new(0, 1, 0), math.min(dt * 6, 1))
+			local h = piloting and cast(spos, flat * WALL_SEEK)
+			if h and math.abs(h.Normal.Y) < 0.5 and inMag > 0.15 then      -- wall ahead + pushing into it
+				climbing, surfN = true, h.Normal
+				spos = h.Position + h.Normal * BODY_H
+				hum.PlatformStand = true
 			end
-			if l.stepT then
-				l.stepT += dt / STEP_T
-				local t = math.clamp(l.stepT, 0, 1)
-				l.foot = l.from:Lerp(l.to, t) + Vector3.new(0, math.sin(t * math.pi) * STEP_LIFT, 0)
-				if l.stepT >= 1 then l.foot, l.stepT = l.to, nil;  stepping -= 1 end
+		end
+		if climbing then
+			local probe = cast(spos + surfN * 2, -surfN * (BODY_H + 7))
+			if probe and math.abs(probe.Normal.Y) < 0.9 then
+				surfN = surfN:Lerp(probe.Normal, math.min(dt * 9, 1)).Unit
+				spos = probe.Position + surfN * BODY_H
+			else                                                          -- ran off the wall
+				climbing = false;  hum.PlatformStand = false
+				hrp.CFrame = CFrame.new(spos + Vector3.new(0, 0.6, 0))
 			end
-			local sh = bcf * l.shoulder
-			local knee = (sh + l.foot) * 0.5 + Vector3.new(0, KNEE_UP, 0)
-			place(l.u, sh, knee)
-			place(l.lo, knee, l.foot)
+		end
+		if climbing then
+			local wUp = Vector3.new(0, 1, 0) - surfN * surfN.Y
+			if wUp.Magnitude < 0.08 then wUp = flat - surfN * flat:Dot(surfN) end   -- ceiling: use facing
+			wUp = wUp.Unit
+			local wRight = surfN:Cross(wUp).Unit
+			if jumpReq then
+				jumpReq, climbing = false, false
+				hum.PlatformStand = false
+				hrp.CFrame = CFrame.new(spos + surfN * 1.5)
+				hrp.AssemblyLinearVelocity = surfN * 26 + Vector3.new(0, 34, 0)
+			else
+				spos += (wUp * -mv.Z + wRight * mv.X) * CLIMB_SPD * dt
+				local re = cast(spos + surfN * (BODY_H + 2), -surfN * (BODY_H + 9))
+				if re then spos = re.Position + surfN * BODY_H end
+				hrp.CFrame = CFrame.new(spos)
+				hrp.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+
+		--// ---------- body ----------
+		if not lastP then lastP = spos end
+		local vel = (spos - lastP) / math.max(dt, 1e-3);  lastP = spos
+		local tang = vel - surfN * vel:Dot(surfN)
+		local speed = tang.Magnitude
+		local faceDir = flat
+		if climbing then
+			faceDir = (speed > 0.4) and tang.Unit or (Vector3.new(0, 1, 0) - surfN * surfN.Y)
+			if faceDir.Magnitude < 0.05 then faceDir = flat - surfN * flat:Dot(surfN) end
+			faceDir = faceDir.Unit
+		end
+		local baseCF = CFrame.lookAt(spos, spos + faceDir, surfN)
+
+		gait = (gait + dt * (0.5 + math.min(speed, 40) * CFG.GRATE)) % 1
+		bob += (math.sin(gait * math.pi * 4) * (CFG.GBOB*SP + math.min(speed, 20) * 0.012*SP) - bob) * math.min(dt * 12, 1)
+		local pitch = math.clamp(-speed * 0.012, -0.16, 0)
+		local roll  = math.clamp(-vel:Dot(baseCF.RightVector) * 0.007, -0.16, 0.16)
+		local bodyCF = baseCF * CFrame.new(0, bob, 0) * CFrame.Angles(pitch, 0, roll)
+		local down = -bodyCF.UpVector
+
+		body.CFrame  = bodyCF
+		hull.CFrame  = bodyCF * CFrame.new(0, 0.55*SP, 0.4*SP)
+		core.CFrame  = bodyCF * CFrame.new(0, 1.0*SP, -0.2*SP)
+		under.CFrame = bodyCF * CFrame.new(0, -0.85*SP, 0)
+		eye.CFrame   = bodyCF * CFrame.new(0, 0.15*SP, -2.9*SP)
+		mand1.CFrame = bodyCF * CFrame.new(-0.5*SP, -0.2*SP, -2.6*SP) * CFrame.Angles(math.rad(-18), math.rad(14), 0)
+		mand2.CFrame = bodyCF * CFrame.new( 0.5*SP, -0.2*SP, -2.6*SP) * CFrame.Angles(math.rad(-18), math.rad(-14), 0)
+		abdo.CFrame  = bodyCF * CFrame.new(0, 0.25*SP, 3.4*SP)
+		for s = 1, 8 do
+			local ang = (s - 0.5) / 8 * math.pi * 2
+			local p = (bodyCF * Vector3.new(math.sin(ang) * 1.5*SP, 0.7*SP, math.cos(ang) * 1.8*SP))
+			spikes[s].CFrame = CFrame.lookAt(p, p + (p - bodyCF.Position) + bodyCF.UpVector * 2*SP)
+		end
+
+		local mech = CFG.mech
+		for i, l in ipairs(legs) do
+			local hip = bodyCF * l.hipL
+			local sho = bodyCF * l.shoL
+			local outW = bodyCF:VectorToWorldSpace(l.out)
+
+			local restPt = sho + outW * (REACH * 0.55) + tang * LEAD
+			local h = cast(restPt - down * 5, down * (BODY_H + 12))
+			local ideal = h and h.Position or (restPt + down * BODY_H)
+
+			if l.anchor == Vector3.zero then l.anchor, l.foot = ideal, ideal end
+			local ph = (gait + PHASE[i]) % 1
+			if ph < SWING then
+				local t = ph / SWING
+				if l.planted then l.swingFrom, l.planted = l.foot, false end
+				l.swingTo = ideal
+				local e = t * t * (3 - 2 * t)
+				l.foot = l.swingFrom:Lerp(l.swingTo, e) - down * (math.sin(t * math.pi) * LIFT)
+			else
+				if not l.planted then l.anchor, l.planted = l.foot, true end
+				l.foot = l.anchor
+			end
+
+			local knee = ik(sho, l.foot, FEMUR, TIBIA, outW + bodyCF.UpVector * 0.6)
+			seg(l.coxa, hip, sho, W * 1.4)
+			seg(l.femur, sho, knee, W)
+			seg(l.tibia, knee, l.foot, W * 0.82)
+			local fd = l.foot - knee
+			fd = (fd.Magnitude < 1e-3) and down or fd.Unit
+			local fup = math.abs(fd:Dot(bodyCF.RightVector)) > 0.99 and bodyCF.UpVector or bodyCF.RightVector
+			l.tip.CFrame   = CFrame.lookAt(l.foot + fd * 0.5*SP, l.foot + fd * 2, fup)
+			l.jHip.CFrame  = CFrame.new(sho)
+			l.jKnee.CFrame = CFrame.new(knee)
+
+			if mech then
+				--// ---- Max Mechanical dress-up: hydraulic piston + servos + plates ----
+				local pA = sho:Lerp(knee, 0.16) + fup * (W * 1.1)   -- barrel mount on the femur
+				local pB = knee:Lerp(l.foot, 0.52)                  -- rod mount on the tibia
+				local axis = pB - pA
+				local aL = math.max(axis.Magnitude, 0.2)
+				local aD = axis / aL
+				local barLen = math.min(aL * 0.6, FEMUR * 0.55)
+				bar(l.mBarrel, pA, pA + aD * barLen, W * 1.05)
+				bar(l.mRod,    pA + aD * (barLen - 0.15), pB, W * 0.55)
+				bar(l.mPlate,  sho:Lerp(knee, 0.35), sho:Lerp(knee, 0.75), W * 2.4, W * 0.5)
+				bar(l.mHipBox,  sho:Lerp(knee, -0.14), sho:Lerp(knee, 0.16), W * 2.0)
+				bar(l.mKneeBox, knee:Lerp(l.foot, -0.12), knee:Lerp(l.foot, 0.14), W * 1.7)
+				local function ringCF(at, toward)
+					local d = toward - at
+					d = (d.Magnitude < 1e-3) and Vector3.yAxis or d.Unit
+					local u = (math.abs(d.Y) > 0.99) and Vector3.xAxis or Vector3.yAxis
+					return CFrame.lookAt(at, at + d, u)
+				end
+				l.mHipRing.Size,  l.mHipRing.CFrame  = Vector3.new(W*2.6, W*2.6, W*0.5), ringCF(sho, knee)
+				l.mKneeRing.Size, l.mKneeRing.CFrame = Vector3.new(W*2.1, W*2.1, W*0.5), ringCF(knee, l.foot)
+			end
 		end
 	end
 	RunService.RenderStepped:Connect(function(dt) if alive then frame(dt) end end)
 
-	--// server spider: 1 body + 8 single-segment legs (shoulder -> foot), micro parts + BlockMesh length
+	--// server: body + femur + tibia per leg. IK keeps segments a fixed length -> SyncMove only.
 	local sBody
-	local sLegs = {}     -- { part = , l = <leg ref> }
+	local sSeg = {}
 	local function claim(p)
 		EscalateEvent:FireServer(PartOwnership, { [1] = p })
 		local t0 = os.clock()
 		repeat task.wait(0.01) until p:FindFirstChild("RRPartOwner") or os.clock() - t0 > 5
 		return p:FindFirstChild("RRPartOwner") ~= nil
 	end
+	local function mkServer(name, scale)
+		local cf = CFrame.new(0, -500, 0)
+		local p = ep:InvokeServer("CreatePart", "Normal", cf, workspace)
+		if not (p and claim(p)) then return nil end
+		ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = cf } })
+		ep:InvokeServer("SetName",       { p }, name)
+		ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = GUN } })
+		ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
+		ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
+		ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.Brick, Scale = scale } })
+		ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Material = Enum.Material.Metal, Transparency = 1 } })
+		ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
+		castShadowOff(p)
+		p.CanQuery = false
+		spiderServer[#spiderServer + 1] = p
+		return p
+	end
 	task.spawn(function()
-		local p = ep:InvokeServer("CreatePart", "Normal", body.CFrame, workspace)
-		if p and claim(p) then
-			ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = body.CFrame } })
-			ep:InvokeServer("SetName",       { p }, "SpiderBody")
-			ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = DARK } })
-			ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
-			ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
-			ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.Sphere,
-				Scale = Vector3.new(2.4 * MESH_SCALE, 1.7 * MESH_SCALE, 3.1 * MESH_SCALE) } })
-			ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Transparency = 1 } })
-			ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
-			castShadowOff(p)
-			p.CanQuery = false   -- client-side: raycasts ignore it
-			sBody = p;  spiderServer[#spiderServer + 1] = p
-		end
+		local sp = CFG.SP
+		sBody = mkServer("SpiderBody", Vector3.new(4.6*sp*MESH_SCALE, 1.5*sp*MESH_SCALE, 5.6*sp*MESH_SCALE))
 	end)
-	for i = 1, 8 do
+	for i = 1, NLEG do
 		task.spawn(function()
-			local l = legs[i]
-			local p = ep:InvokeServer("CreatePart", "Normal", l.u.CFrame, workspace)
-			if p and claim(p) then
-				ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = l.u.CFrame } })
-				ep:InvokeServer("SetName",       { p }, "SpiderLeg")
-				ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = DARK } })
-				ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
-				ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
-				ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.Brick,
-					Scale = Vector3.new(THK * MESH_SCALE, THK * MESH_SCALE, MESH_SCALE) } })
-				ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Transparency = 1 } })
-				ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
-				castShadowOff(p)
-				p.CanQuery = false
-				sLegs[#sLegs + 1] = { part = p, l = l }
-				spiderServer[#spiderServer + 1] = p
-			end
+			local sp = CFG.SP
+			local fw = CFG.W * sp * MESH_SCALE
+			local f = mkServer("SpiderLeg", Vector3.new(fw, fw, CFG.FEMUR * sp * MESH_SCALE))
+			local t = mkServer("SpiderLeg", Vector3.new(fw * 0.82, fw * 0.82, CFG.TIBIA * sp * MESH_SCALE))
+			if f then sSeg[#sSeg + 1] = { part = f, i = i, k = "f" } end
+			if t then sSeg[#sSeg + 1] = { part = t, i = i, k = "t" } end
 		end)
-		task.wait(0.02)
+		task.wait(0.03)
 	end
 
 	local acc = 0
 	RunService.Heartbeat:Connect(function(dt)
 		if not alive or not spiderOn then return end
 		acc += dt;  if acc < 1 / 30 then return end;  acc = 0
-		local mv, ms = {}, {}
-		if sBody then mv[#mv + 1] = { Part = sBody, CFrame = body.CFrame } end
-		for _, e in ipairs(sLegs) do
-			local sh = body.CFrame * e.l.shoulder
-			local d = e.l.foot - sh
-			local len = math.max(d.Magnitude, 0.05)
-			local up = math.abs(d.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
-			mv[#mv + 1] = { Part = e.part, CFrame = CFrame.lookAt((sh + e.l.foot) * 0.5, e.l.foot, up) }
-			ms[#ms + 1] = { Part = e.part, Scale = Vector3.new(THK * MESH_SCALE, THK * MESH_SCALE, len * MESH_SCALE) }
+		local mv = {}
+		if sBody then mv[#mv + 1] = { Part = sBody, CFrame = body.CFrame };  sBody.LocalTransparencyModifier = 1;  sBody.CastShadow = false end
+		for _, s in ipairs(sSeg) do
+			local part = (s.k == "f") and legs[s.i].femur or legs[s.i].tibia
+			mv[#mv + 1] = { Part = s.part, CFrame = part.CFrame }
+			s.part.LocalTransparencyModifier = 1;  s.part.CastShadow = false
 		end
-		if #mv > 0 then
-			task.spawn(function() pcall(invoke, ep, "SyncMove", mv) end)
-			task.spawn(function() pcall(invoke, ep, "SyncMesh", ms) end)
-		end
-		if sBody then sBody.LocalTransparencyModifier = spiderOn and 1 or 0 end
-		for _, e in ipairs(sLegs) do e.part.LocalTransparencyModifier = 1;  e.part.CastShadow = false end
+		if #mv > 0 then task.spawn(function() pcall(invoke, ep, "SyncMove", mv) end) end
 	end)
 
-	--// toggle: hide the R6 rig, show the spider (and back)
-	local R6_PARTS = { "Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }
+	--// ---- Special Skins: not just colours — proportions, gait, materials, decorations ----
+	local SSKINS = {
+		{ name="Recon",   sp=1.4,  w=0.42, fem=3.8, tib=5.0, reach=7.2, bh=3.6, sw=0.42, lift=1.9, grate=0.09, gbob=0.12,
+		  ang={34,66,114,146,-34,-66,-114,-146},
+		  bmat=Enum.Material.DiamondPlate, lmat=Enum.Material.Metal, col=GUN, refl=0, trans=0, acc=nil,
+		  bsz=Vector3.new(4.6,1.5,5.6), hsz=Vector3.new(3.0,1.8,3.6) },
+
+		{ name="Goliath", sp=2.1,  w=0.64, fem=3.2, tib=4.1, reach=6.4, bh=4.7, sw=0.52, lift=1.5, grate=0.05, gbob=0.24,
+		  ang={40,72,108,140,-40,-72,-108,-140},
+		  bmat=Enum.Material.Metal, lmat=Enum.Material.DiamondPlate, col=Color3.fromRGB(48,44,40), refl=0.06, trans=0, acc=Color3.fromRGB(255,140,25),
+		  bsz=Vector3.new(5.6,2.4,6.4), hsz=Vector3.new(4.2,2.6,4.6), spikes=true },
+
+		{ name="Widow",   sp=1.35, w=0.28, fem=5.2, tib=6.9, reach=9.8, bh=2.9, sw=0.34, lift=2.6, grate=0.15, gbob=0.07,
+		  ang={26,52,128,154,-26,-52,-128,-154},
+		  bmat=Enum.Material.SmoothPlastic, lmat=Enum.Material.SmoothPlastic, col=Color3.fromRGB(12,9,11), refl=0, trans=0, acc=Color3.fromRGB(225,20,45),
+		  bsz=Vector3.new(3.2,1.3,3.8), hsz=Vector3.new(2.4,1.5,2.8), abdomen=true, spikes=true,
+		  particle={ col=Color3.fromRGB(120,255,90), rate=9, rear=true } },
+
+		{ name="Wraith",  sp=1.4,  w=0.34, fem=4.1, tib=5.4, reach=7.8, bh=4.6, sw=0.44, lift=2.3, grate=0.08, gbob=0.05,
+		  ang={32,64,116,148,-32,-64,-116,-148},
+		  bmat=Enum.Material.Glass, lmat=Enum.Material.Glass, col=Color3.fromRGB(28,10,46), refl=0.12, trans=0.5, acc=Color3.fromRGB(175,65,255),
+		  bsz=Vector3.new(4.2,1.4,5.0), hsz=Vector3.new(3.0,1.6,3.4),
+		  particle={ col=Color3.fromRGB(175,65,255), rate=34 } },
+
+		{ name="Chrome",  sp=1.4,  w=0.4,  fem=3.9, tib=5.1, reach=7.4, bh=3.6, sw=0.4,  lift=1.8, grate=0.12, gbob=0.09,
+		  ang={34,66,114,146,-34,-66,-114,-146},
+		  bmat=Enum.Material.Metal, lmat=Enum.Material.Metal, col=Color3.fromRGB(214,218,226), refl=0.6, trans=0, acc=Color3.fromRGB(255,255,255),
+		  bsz=Vector3.new(4.6,1.35,5.4), hsz=Vector3.new(3.0,1.6,3.4) },
+
+		{ name="Hornet",  sp=1.4,  w=0.4,  fem=3.6, tib=4.8, reach=7.0, bh=3.5, sw=0.4,  lift=1.8, grate=0.13, gbob=0.13,
+		  ang={36,68,112,144,-36,-68,-112,-144},
+		  bmat=Enum.Material.DiamondPlate, lmat=Enum.Material.Metal, col=Color3.fromRGB(24,22,16), refl=0.04, trans=0, acc=Color3.fromRGB(255,205,0),
+		  bsz=Vector3.new(4.4,1.5,5.4), hsz=Vector3.new(3.0,1.8,3.4), abdomen=true },
+
+		{ name="Frost",   sp=1.45, w=0.4,  fem=4.0, tib=5.2, reach=7.6, bh=3.8, sw=0.42, lift=2.0, grate=0.09, gbob=0.1,
+		  ang={34,66,114,146,-34,-66,-114,-146},
+		  bmat=Enum.Material.Glass, lmat=Enum.Material.Ice, col=Color3.fromRGB(205,235,255), refl=0.25, trans=0.15, acc=Color3.fromRGB(120,220,255),
+		  bsz=Vector3.new(4.4,1.5,5.4), hsz=Vector3.new(3.0,1.7,3.4), spikes=true,
+		  particle={ col=Color3.fromRGB(200,240,255), rate=16 } },
+
+		{ name="Obsidian",sp=1.5,  w=0.46, fem=3.8, tib=5.0, reach=7.2, bh=3.7, sw=0.44, lift=1.9, grate=0.08, gbob=0.14,
+		  ang={38,70,110,142,-38,-70,-110,-142},
+		  bmat=Enum.Material.Slate, lmat=Enum.Material.Slate, col=Color3.fromRGB(14,14,18), refl=0.05, trans=0, acc=Color3.fromRGB(255,60,60),
+		  bsz=Vector3.new(4.8,1.6,5.8), hsz=Vector3.new(3.2,1.9,3.6), spikes=true },
+
+		{ name="Solar",   sp=1.45, w=0.42, fem=3.9, tib=5.1, reach=7.4, bh=3.7, sw=0.42, lift=1.9, grate=0.1, gbob=0.11,
+		  ang={34,66,114,146,-34,-66,-114,-146},
+		  bmat=Enum.Material.Metal, lmat=Enum.Material.DiamondPlate, col=Color3.fromRGB(60,40,20), refl=0.2, trans=0, acc=Color3.fromRGB(255,150,40),
+		  bsz=Vector3.new(4.6,1.5,5.6), hsz=Vector3.new(3.0,1.8,3.4),
+		  particle={ col=Color3.fromRGB(255,150,40), rate=26 } },
+
+		{ name="MaxMech", sp=1.7,  w=0.5,  fem=3.9, tib=5.2, reach=7.6, bh=4.2, sw=0.46, lift=1.7, grate=0.06, gbob=0.18,
+		  ang={38,70,110,142,-38,-70,-110,-142},
+		  bmat=Enum.Material.DiamondPlate, lmat=Enum.Material.Metal, col=Color3.fromRGB(46,48,54), refl=0.1, trans=0, acc=Color3.fromRGB(255,120,20),
+		  bsz=Vector3.new(5.4,2.1,6.2), hsz=Vector3.new(3.8,2.3,4.2), mech=true, spikes=true,
+		  particle={ col=Color3.fromRGB(255,120,20), rate=14, rear=true } },
+	}
+	local ssIdx = 1
+	local function acCol() return SSKINS[ssIdx].acc or glow() end
+
+	local function applySSkin(n)
+		ssIdx = (((n or ssIdx + 1) - 1) % #SSKINS) + 1
+		local S = SSKINS[ssIdx]
+		CFG.SP, CFG.W, CFG.FEMUR, CFG.TIBIA = S.sp, S.w, S.fem, S.tib
+		CFG.REACH, CFG.BODY_H, CFG.SWING, CFG.LIFT = S.reach, S.bh, S.sw, S.lift
+		CFG.GRATE, CFG.GBOB, CFG.ANG, CFG.mech = S.grate, S.gbob, S.ang, S.mech or false
+		local sp, ac = S.sp, acCol()
+		local tr = spiderOn and (S.trans or 0) or 1
+		local acT = spiderOn and 0 or 1
+		local mShow = (S.mech and spiderOn) and (S.trans or 0) or 1   -- mech dress-up parts (MaxMech only)
+		local mAcc  = (S.mech and spiderOn) and 0 or 1
+
+		for i, l in ipairs(legs) do
+			local a = math.rad(S.ang[i])
+			l.out  = Vector3.new(math.sin(a), 0, math.cos(a))
+			l.hipL = l.out * (CFG.HIP_R * sp) + Vector3.new(0, CFG.HIP_UP * sp, 0)
+			l.shoL = l.out * ((CFG.HIP_R + CFG.SHO_OUT) * sp) + Vector3.new(0, (CFG.HIP_UP + CFG.SHO_UP) * sp, 0)
+			local w = S.w * sp
+			for _, part in ipairs({ l.coxa, l.femur, l.tibia }) do
+				part.Material, part.Color, part.Reflectance, part.Transparency = S.lmat, S.col, S.refl or 0, tr
+			end
+			l.coxa.Size  = Vector3.new(w*1.4, w*1.4, 1)
+			l.femur.Size = Vector3.new(w, w, S.fem * sp)
+			l.tibia.Size = Vector3.new(w*0.82, w*0.82, S.tib * sp)
+			l.tip.Size,  l.tip.Color,  l.tip.Transparency  = Vector3.new(w*0.9, w*0.9, 1.2*sp), ac, acT
+			l.jHip.Size, l.jHip.Color, l.jHip.Transparency  = Vector3.new(0.55*sp, 0.55*sp, 0.55*sp), ac, acT
+			l.jKnee.Size, l.jKnee.Color, l.jKnee.Transparency = Vector3.new(0.48*sp, 0.48*sp, 0.48*sp), ac, acT
+			for _, mp in ipairs({ l.mBarrel, l.mRod, l.mHipBox, l.mKneeBox, l.mPlate }) do
+				mp.Material, mp.Color, mp.Reflectance, mp.Transparency = S.lmat, S.col, S.refl or 0, mShow
+			end
+			l.mRod.Material, l.mRod.Color, l.mRod.Reflectance = Enum.Material.Metal, Color3.fromRGB(205, 210, 220), 0.4
+			l.mHipRing.Color, l.mHipRing.Transparency  = ac, mAcc
+			l.mKneeRing.Color, l.mKneeRing.Transparency = ac, mAcc
+		end
+
+		body.Size, body.Material, body.Color, body.Reflectance, body.Transparency = S.bsz*sp, S.bmat, S.col, S.refl or 0, tr
+		hull.Size, hull.Color, hull.Reflectance, hull.Transparency = S.hsz*sp, S.col, S.refl or 0, tr
+		core.Size,  core.Color,  core.Transparency  = Vector3.new(1.5*sp, 0.5*sp, 3.0*sp), ac, acT
+		under.Size, under.Color, under.Transparency = Vector3.new(2.2*sp, 0.3*sp, 2.6*sp), ac, acT
+		eye.Size,   eye.Color,   eye.Transparency   = Vector3.new(0.6*sp, 0.6*sp, 0.6*sp), ac, acT
+		mand1.Size, mand1.Color, mand1.Transparency = Vector3.new(S.w*sp, S.w*sp, 1.6*sp), S.col, tr
+		mand2.Size, mand2.Color, mand2.Transparency = mand1.Size, S.col, tr
+
+		abdo.Size, abdo.Color = Vector3.new(2.8*sp, 2.6*sp, 3.4*sp), S.col
+		abdo.Transparency = (S.abdomen and spiderOn) and (S.trans or 0) or 1
+		for _, k in ipairs(spikes) do
+			k.Size, k.Color = Vector3.new(0.28*sp, 0.28*sp, 1.5*sp), DKR
+			k.Transparency  = (S.spikes and spiderOn) and 0 or 1
+		end
+		if S.particle then
+			particle.Enabled = spiderOn
+			particle.Rate = S.particle.rate or 20
+			particle.Color = ColorSequence.new(S.particle.col or ac)
+			pAtt.Position = Vector3.new(0, -0.3*sp, S.particle.rear and 2.2*sp or 0)
+		else
+			particle.Enabled = false
+		end
+
+		task.spawn(function()
+			local mesh, mat = {}, {}
+			if sBody then
+				mesh[#mesh+1] = { Part = sBody, Scale = S.bsz * sp * MESH_SCALE }
+				mat[#mat+1]   = { Part = sBody, Color = S.col }
+			end
+			for _, s in ipairs(sSeg) do
+				local w = S.w * sp * MESH_SCALE
+				local len = ((s.k == "f") and S.fem or S.tib) * sp * MESH_SCALE
+				mesh[#mesh+1] = { Part = s.part, Scale = Vector3.new(w, w, len) }
+				mat[#mat+1]   = { Part = s.part, Color = S.col }
+			end
+			if #mesh > 0 then pcall(invoke, ep, "SyncMesh", mesh) end
+			if #mat > 0 then pcall(invoke, ep, "SyncColor", mat) end
+		end)
+
+		if ssBtn then ssBtn.Text = "SSkin: " .. S.name end
+	end
+	_G.R6Rig_SSkin = applySSkin
+
+	spiderRecolor = function()
+		if SSKINS[ssIdx].acc == nil then applySSkin(ssIdx) end   -- Recon follows the regular skin glow
+	end
+
+	local R6 = { "Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }
 	setSpider = function(on)
 		spiderOn = on
-		for _, n in ipairs(R6_PARTS) do localParts[n].Transparency = on and 1 or (SKINS[skinIdx].trans or 0) end
+		if not on and climbing then climbing = false;  hum.PlatformStand = false end
+		for _, n in ipairs(R6) do localParts[n].Transparency = on and 1 or (SKINS[skinIdx].trans or 0) end
 		local fd = localParts.Head:FindFirstChild("face");  if fd then fd.Transparency = on and 1 or 0 end
-		body.Transparency = on and 0 or 1
-		for _, l in ipairs(legs) do l.u.Transparency = on and 0 or 1;  l.lo.Transparency = on and 0 or 1 end
 		if on and swordOn and setSword then setSword(false) end
+		applySSkin(ssIdx)   -- sizes + colours + shows/hides all spider + decoration parts
 		task.spawn(function()
-			local rig, spd = {}, {}
-			for name, sp in pairs(serverParts) do rig[#rig + 1] = { Part = sp, Transparency = on and 1 or (SKINS[skinIdx].trans or 0) } end
-			if sBody then spd[#spd + 1] = { Part = sBody, Transparency = on and 0 or 1 } end
-			for _, e in ipairs(sLegs) do spd[#spd + 1] = { Part = e.part, Transparency = on and 0 or 1 } end
-			if #rig > 0 then pcall(invoke, ep, "SyncMaterial", rig) end
-			if #spd > 0 then pcall(invoke, ep, "SyncMaterial", spd) end
+			local a, b = {}, {}
+			for _, sp in pairs(serverParts) do a[#a + 1] = { Part = sp, Transparency = on and 1 or (SKINS[skinIdx].trans or 0) } end
+			for _, p in ipairs(spiderServer) do b[#b + 1] = { Part = p, Transparency = on and (SSKINS[ssIdx].trans or 0) or 1 } end
+			if #a > 0 then pcall(invoke, ep, "SyncMaterial", a) end
+			if #b > 0 then pcall(invoke, ep, "SyncMaterial", b) end
 		end)
 		if spiderBtn then
 			spiderBtn.Text = on and "Spider: On" or "Spider: Off"
@@ -1174,6 +1479,8 @@ do
 		end
 	end
 	_G.R6Rig_Spider = setSpider
+
+	applySSkin(1)
 end
 
 if UIS.TouchEnabled then   --// mobile JUMP button (native one is hidden while piloting)
@@ -1309,7 +1616,7 @@ local BUTTONS = {
 	{ "Point", "point" }, { "Dance", "dance" }, { "Dance 2", "dance2" }, { "Dance 3", "dance3" },
 	{ "Laugh", "laugh" }, { "Cheer", "cheer" }, { "Stop", "stop" }, { "Mirror", "__mirror" },
 	{ "Sword", "__sword" }, { "Swing", "__swing" }, { "Skin: Classic", "__skin" },
-	{ "Spy: Off", "__spy" }, { "Spider: Off", "__spider" },
+	{ "Spy: Off", "__spy" }, { "Spider: Off", "__spider" }, { "SSkin: Recon", "__sskin" },
 }
 
 for i, b in ipairs(BUTTONS) do
@@ -1328,6 +1635,7 @@ for i, b in ipairs(BUTTONS) do
 	if b[2] == "__sword" then swordBtn = btn end
 	if b[2] == "__spy" then spyBtn = btn end
 	if b[2] == "__spider" then spiderBtn = btn end
+	if b[2] == "__sskin" then ssBtn = btn end
 	btn.MouseButton1Click:Connect(function()
 		if b[2] == "__mirror" then
 			if piloting then return end
@@ -1344,6 +1652,8 @@ for i, b in ipairs(BUTTONS) do
 			setSpy(spyLevel + 1)
 		elseif b[2] == "__spider" then
 			setSpider(not spiderOn)
+		elseif b[2] == "__sskin" then
+			if _G.R6Rig_SSkin then _G.R6Rig_SSkin() end   -- nil = advance to next
 		else
 			playCat(b[2])
 		end
@@ -1378,6 +1688,20 @@ end)
 
 --// mobile: native thumbstick moves, native button jumps, tap-anywhere swings (UIS.TouchTap above).
 
+--// ---------- kill every shadow this rig could cast (client-side, catch-all) ----------
+task.spawn(function()
+	while alive do
+		for _, d in ipairs(localModel:GetDescendants()) do
+			if d:IsA("BasePart") then d.CastShadow = false end
+		end
+		for _, sp in pairs(serverParts) do sp.CastShadow = false end
+		if swordBlade then swordBlade.CastShadow = false end
+		if tessParts then for _, e in ipairs(tessParts) do if e.sp then e.sp.CastShadow = false end end end
+		for _, p in ipairs(spiderServer) do p.CastShadow = false end
+		task.wait(0.4)
+	end
+end)
+
 --// ---------- start ----------
 setMirror(false)
 playCore("idle");  autoState = "idle"
@@ -1399,4 +1723,4 @@ _G.R6Rig_Stop = function()
 	print("[rig] stopped")
 end
 
-print("[rig] running — PILOT to drive | Spider / Spy / Skin buttons | Noob slider | _G.R6Rig_Stop()")
+print("[rig] running - PILOT | Spider (climbs walls) + SSkins | Spy | Skin | Noob slider | _G.R6Rig_Stop()")
