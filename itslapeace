@@ -249,6 +249,7 @@ end
 --// ---------- animation ----------
 local mode = "anim"      -- "anim" | "mirror"
 local piloting = false
+local pilotEmote = false  -- an emote is playing during pilot; suspends the walk/idle state machine
 local currentTrack, autoState
 local trackCache = {}
 
@@ -311,11 +312,18 @@ local function setMirror(on)
 	end
 end
 
-local function playCat(cat)            -- GUI emote button
-	if piloting then return end
+local function playCat(cat)            -- GUI emote button (works while piloting too)
 	if mode == "mirror" then setMirror(false); if mirrorBtn then end end
 	autoState = nil
 	playCore(cat)
+	if piloting then
+		pilotEmote = (cat ~= "stop")
+		if pilotEmote and ONESHOT[cat] then                 -- wave/point/laugh/jump: auto-resume after it ends
+			local L = (currentTrack and currentTrack.Length) or 0
+			if L <= 0 then L = 1.2 end
+			task.delay(L, function() pilotEmote = false end)
+		end
+	end
 end
 
 --// ---------- PILOT ----------
@@ -327,7 +335,7 @@ local function setPilot(on)
 
 	if on then
 		if mode == "mirror" then setMirror(false) end
-		autoState = nil
+		autoState = nil;  pilotEmote = false
 		hum.PlatformStand = false
 		localParts.HumanoidRootPart.Anchored = false
 		localParts["Left Leg"].CanCollide = true
@@ -356,7 +364,7 @@ local function setPilot(on)
 			realHum.JumpPower = savedJP or 0
 			realHum.JumpHeight = savedJH or 7.2
 		end
-		autoState = nil
+		autoState = nil;  pilotEmote = false
 		playCore("idle")
 	end
 	if pilotBtn then
@@ -402,17 +410,26 @@ RunService.RenderStepped:Connect(function()
 		hum:Move(dir, true)   -- true = relative to camera (matches GetMoveVector's space)
 
 		local st = hum:GetState()
-		if st == Enum.HumanoidStateType.Jumping then
-			autoAnim("jump")
-		elseif st == Enum.HumanoidStateType.Freefall then
-			autoAnim("fall")
-		elseif st == Enum.HumanoidStateType.Climbing then
-			autoAnim("climb")
-		elseif hum.MoveDirection.Magnitude > 0.05 then
-			autoAnim(running and "run" or "walk")
-			if currentTrack then currentTrack:AdjustSpeed(hum.WalkSpeed / 16) end
+		local moving = hum.MoveDirection.Magnitude > 0.05 or dir.Magnitude > 0.05
+		local air = st == Enum.HumanoidStateType.Jumping or st == Enum.HumanoidStateType.Freefall
+			or st == Enum.HumanoidStateType.Climbing
+
+		if pilotEmote and not moving and not air then
+			-- an emote is playing: leave the animation alone until you move or leave the ground
 		else
-			autoAnim("idle")   -- toolnone is a separate persistent overlay (holdTrack), not a state
+			pilotEmote = false
+			if st == Enum.HumanoidStateType.Jumping then
+				autoAnim("jump")
+			elseif st == Enum.HumanoidStateType.Freefall then
+				autoAnim("fall")
+			elseif st == Enum.HumanoidStateType.Climbing then
+				autoAnim("climb")
+			elseif moving then
+				autoAnim(running and "run" or "walk")
+				if currentTrack then currentTrack:AdjustSpeed(hum.WalkSpeed / 16) end
+			else
+				autoAnim("idle")   -- toolnone is a separate persistent overlay (holdTrack), not a state
+			end
 		end
 	else
 		local base = baseCF() * CFrame.new(0, 3 * (curScale - 1), 0)   -- lift so bigger rigs keep feet on ground
