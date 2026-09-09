@@ -261,6 +261,9 @@ local spyLevel = 0        -- 0 off | 1 hide tesseract | 2 also ghost the body 50
 local tessHidden = false
 local setSpy              -- defined after the sword/tesseract are built
 local mobileJumpGui       -- touch JUMP button (the native one hides when we zero the real char's jump)
+local spiderOn = false
+local setSpider           -- swap the R6 rig for a procedural spider (defined after everything is built)
+local spiderServer = {}   -- server-side spider parts, for cleanup
 local currentTrack, autoState
 local trackCache = {}
 
@@ -593,7 +596,7 @@ local function applySkin(i)
 		p.Color = colorFor(sk, s.name)
 		p.Material = mat
 		p.Reflectance = sk.reflect or 0
-		if s.name ~= "HumanoidRootPart" then p.Transparency = sk.trans or 0 end
+		if s.name ~= "HumanoidRootPart" then p.Transparency = spiderOn and 1 or (sk.trans or 0) end
 	end
 	glow.OutlineColor = sk.glow or sk.body
 	glow.Enabled = sk.glow ~= nil
@@ -615,7 +618,7 @@ local function applySkin(i)
 			local col = colorFor(sk, name)
 			task.spawn(function()
 				pcall(invoke, ep, "SyncColor",    { [1] = { Part = sp, Color = col } })
-				pcall(invoke, ep, "SyncMaterial", { [1] = { Part = sp, Material = mat, Transparency = sk.trans or 0, Reflectance = sk.reflect or 0 } })
+				pcall(invoke, ep, "SyncMaterial", { [1] = { Part = sp, Material = mat, Transparency = spiderOn and 1 or (sk.trans or 0), Reflectance = sk.reflect or 0 } })
 			end)
 		end
 		if setSpy and spyLevel > 0 then task.wait(0.05); setSpy(spyLevel) end   -- re-assert spy over the new skin
@@ -980,6 +983,199 @@ setSpy = function(lvl)
 end
 _G.R6Rig_Spy = setSpy
 
+--// ---------- SPIDER MODE ----------
+--// swaps the visible R6 rig for a procedural 8-leg spider that walks itself.
+--// the invisible HumanoidRootPart still does the moving (pilot / idle), the body rides it,
+--// the legs plant on the ground and step as it goes. client + server.
+do
+	local ANG      = { 42, 74, 106, 138, -42, -74, -106, -138 }   -- leg splay, degrees from forward
+	local BODY_H   = 1.8      -- body height above ground
+	local REACH    = 4.2      -- foot distance from body
+	local SHRUG    = 1.25     -- shoulder height above body centre
+	local STEP_D   = 1.8      -- overreach that triggers a step
+	local STEP_T   = 0.13     -- seconds per step
+	local STEP_LIFT= 0.9
+	local KNEE_UP  = 1.4
+	local THK      = 0.22
+	local DARK     = Color3.fromRGB(20, 20, 26)
+
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	local function groundY(x, z, fb)
+		--// exclude our own parts — the server copies sit right under the ray and would make it climb
+		local ex = { localModel, plr.Character }
+		for _, p in ipairs(spiderServer) do ex[#ex + 1] = p end
+		for _, p in pairs(serverParts) do ex[#ex + 1] = p end
+		if swordBlade then ex[#ex + 1] = swordBlade end
+		if tessParts then for _, e in ipairs(tessParts) do if e.sp then ex[#ex + 1] = e.sp end end end
+		rp.FilterDescendantsInstances = ex
+		local hit = workspace:Raycast(Vector3.new(x, fb + 40, z), Vector3.new(0, -300, 0), rp)
+		return hit and hit.Position.Y or fb
+	end
+	local function place(part, a, b)
+		local d = b - a
+		local len = math.max(d.Magnitude, 0.05)
+		local up = math.abs(d.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
+		part.Size = Vector3.new(THK, THK, len)
+		part.CFrame = CFrame.lookAt((a + b) * 0.5, b, up)
+	end
+
+	--// local spider
+	local body = Instance.new("Part")
+	body.Name = "SpiderBody";  body.Shape = Enum.PartType.Ball;  body.Size = Vector3.new(2.4, 1.7, 3.1)
+	body.Material = Enum.Material.SmoothPlastic;  body.Color = DARK;  body.Anchored = true
+	body.CanCollide = false;  body.CanQuery = false;  body.CanTouch = false
+	body.CastShadow = false;  body.Transparency = 1;  body.Parent = localModel
+
+	local legs = {}
+	for i = 1, 8 do
+		local a = math.rad(ANG[i])
+		local u = Instance.new("Part")
+		u.Name = "SpiderLeg";  u.Size = Vector3.new(THK, THK, 1);  u.Material = Enum.Material.SmoothPlastic
+		u.Color = DARK;  u.Anchored = true;  u.CanCollide = false;  u.CanQuery = false;  u.CanTouch = false
+		u.Massless = true;  u.CastShadow = false;  u.Transparency = 1;  u.Parent = body
+		local lo = u:Clone();  lo.Parent = body
+		legs[i] = {
+			shoulder = Vector3.new(math.sin(a) * 1.1, SHRUG, math.cos(a) * 1.1),
+			rest     = Vector3.new(math.sin(a) * REACH, 0, math.cos(a) * REACH),
+			foot = Vector3.zero, stepT = nil, from = Vector3.zero, to = Vector3.zero,
+			u = u, lo = lo,
+		}
+	end
+
+	local lastBody, stepping = Vector3.zero, 0
+	local function frame(dt)
+		if not spiderOn then return end
+		local hrp = localParts.HumanoidRootPart
+		local gy = groundY(hrp.Position.X, hrp.Position.Z, hrp.Position.Y - 3)
+		local look = hrp.CFrame.LookVector
+		local flat = Vector3.new(look.X, 0, look.Z)
+		if flat.Magnitude < 1e-3 then flat = Vector3.new(0, 0, -1) end
+		local airborne = (hrp.Position.Y - gy) > 5.5
+		local bpos = Vector3.new(hrp.Position.X, airborne and (hrp.Position.Y - 2.5) or (gy + BODY_H), hrp.Position.Z)
+		local bcf = CFrame.lookAt(bpos, bpos + flat)
+		local vel = (bpos - lastBody) / math.max(dt, 1e-3);  lastBody = bpos
+		body.CFrame = bcf * CFrame.Angles(math.rad(math.clamp(vel.Magnitude * 0.6, 0, 12)), 0, 0)  -- lean
+
+		for _, l in ipairs(legs) do
+			local restW = bcf * l.rest
+			restW = Vector3.new(restW.X, groundY(restW.X, restW.Z, restW.Y), restW.Z)
+			if l.foot == Vector3.zero then l.foot = restW end
+			if not l.stepT and stepping < 4 and (l.foot - restW).Magnitude > STEP_D then
+				l.stepT, l.from = 0, l.foot
+				l.to = restW + Vector3.new(vel.X, 0, vel.Z) * 0.12
+				stepping += 1
+			end
+			if l.stepT then
+				l.stepT += dt / STEP_T
+				local t = math.clamp(l.stepT, 0, 1)
+				l.foot = l.from:Lerp(l.to, t) + Vector3.new(0, math.sin(t * math.pi) * STEP_LIFT, 0)
+				if l.stepT >= 1 then l.foot, l.stepT = l.to, nil;  stepping -= 1 end
+			end
+			local sh = bcf * l.shoulder
+			local knee = (sh + l.foot) * 0.5 + Vector3.new(0, KNEE_UP, 0)
+			place(l.u, sh, knee)
+			place(l.lo, knee, l.foot)
+		end
+	end
+	RunService.RenderStepped:Connect(function(dt) if alive then frame(dt) end end)
+
+	--// server spider: 1 body + 8 single-segment legs (shoulder -> foot), micro parts + BlockMesh length
+	local sBody
+	local sLegs = {}     -- { part = , l = <leg ref> }
+	local function claim(p)
+		EscalateEvent:FireServer(PartOwnership, { [1] = p })
+		local t0 = os.clock()
+		repeat task.wait(0.01) until p:FindFirstChild("RRPartOwner") or os.clock() - t0 > 5
+		return p:FindFirstChild("RRPartOwner") ~= nil
+	end
+	task.spawn(function()
+		local p = ep:InvokeServer("CreatePart", "Normal", body.CFrame, workspace)
+		if p and claim(p) then
+			ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = body.CFrame } })
+			ep:InvokeServer("SetName",       { p }, "SpiderBody")
+			ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = DARK } })
+			ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
+			ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
+			ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.Sphere,
+				Scale = Vector3.new(2.4 * MESH_SCALE, 1.7 * MESH_SCALE, 3.1 * MESH_SCALE) } })
+			ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Transparency = 1 } })
+			ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
+			castShadowOff(p)
+			p.CanQuery = false   -- client-side: raycasts ignore it
+			sBody = p;  spiderServer[#spiderServer + 1] = p
+		end
+	end)
+	for i = 1, 8 do
+		task.spawn(function()
+			local l = legs[i]
+			local p = ep:InvokeServer("CreatePart", "Normal", l.u.CFrame, workspace)
+			if p and claim(p) then
+				ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = l.u.CFrame } })
+				ep:InvokeServer("SetName",       { p }, "SpiderLeg")
+				ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = DARK } })
+				ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
+				ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
+				ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.Brick,
+					Scale = Vector3.new(THK * MESH_SCALE, THK * MESH_SCALE, MESH_SCALE) } })
+				ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Transparency = 1 } })
+				ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
+				castShadowOff(p)
+				p.CanQuery = false
+				sLegs[#sLegs + 1] = { part = p, l = l }
+				spiderServer[#spiderServer + 1] = p
+			end
+		end)
+		task.wait(0.02)
+	end
+
+	local acc = 0
+	RunService.Heartbeat:Connect(function(dt)
+		if not alive or not spiderOn then return end
+		acc += dt;  if acc < 1 / 30 then return end;  acc = 0
+		local mv, ms = {}, {}
+		if sBody then mv[#mv + 1] = { Part = sBody, CFrame = body.CFrame } end
+		for _, e in ipairs(sLegs) do
+			local sh = body.CFrame * e.l.shoulder
+			local d = e.l.foot - sh
+			local len = math.max(d.Magnitude, 0.05)
+			local up = math.abs(d.Unit.Y) > 0.99 and Vector3.new(1, 0, 0) or Vector3.new(0, 1, 0)
+			mv[#mv + 1] = { Part = e.part, CFrame = CFrame.lookAt((sh + e.l.foot) * 0.5, e.l.foot, up) }
+			ms[#ms + 1] = { Part = e.part, Scale = Vector3.new(THK * MESH_SCALE, THK * MESH_SCALE, len * MESH_SCALE) }
+		end
+		if #mv > 0 then
+			task.spawn(function() pcall(invoke, ep, "SyncMove", mv) end)
+			task.spawn(function() pcall(invoke, ep, "SyncMesh", ms) end)
+		end
+		if sBody then sBody.LocalTransparencyModifier = spiderOn and 1 or 0 end
+		for _, e in ipairs(sLegs) do e.part.LocalTransparencyModifier = 1;  e.part.CastShadow = false end
+	end)
+
+	--// toggle: hide the R6 rig, show the spider (and back)
+	local R6_PARTS = { "Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }
+	setSpider = function(on)
+		spiderOn = on
+		for _, n in ipairs(R6_PARTS) do localParts[n].Transparency = on and 1 or (SKINS[skinIdx].trans or 0) end
+		local fd = localParts.Head:FindFirstChild("face");  if fd then fd.Transparency = on and 1 or 0 end
+		body.Transparency = on and 0 or 1
+		for _, l in ipairs(legs) do l.u.Transparency = on and 0 or 1;  l.lo.Transparency = on and 0 or 1 end
+		if on and swordOn and setSword then setSword(false) end
+		task.spawn(function()
+			local rig, spd = {}, {}
+			for name, sp in pairs(serverParts) do rig[#rig + 1] = { Part = sp, Transparency = on and 1 or (SKINS[skinIdx].trans or 0) } end
+			if sBody then spd[#spd + 1] = { Part = sBody, Transparency = on and 0 or 1 } end
+			for _, e in ipairs(sLegs) do spd[#spd + 1] = { Part = e.part, Transparency = on and 0 or 1 } end
+			if #rig > 0 then pcall(invoke, ep, "SyncMaterial", rig) end
+			if #spd > 0 then pcall(invoke, ep, "SyncMaterial", spd) end
+		end)
+		if spiderBtn then
+			spiderBtn.Text = on and "Spider: On" or "Spider: Off"
+			spiderBtn.BackgroundColor3 = on and Color3.fromRGB(120, 70, 40) or Color3.fromRGB(46, 46, 56)
+		end
+	end
+	_G.R6Rig_Spider = setSpider
+end
+
 if UIS.TouchEnabled then   --// mobile JUMP button (native one is hidden while piloting)
 	mobileJumpGui = Instance.new("ScreenGui")
 	mobileJumpGui.Name = "R6RigJump"
@@ -1113,7 +1309,7 @@ local BUTTONS = {
 	{ "Point", "point" }, { "Dance", "dance" }, { "Dance 2", "dance2" }, { "Dance 3", "dance3" },
 	{ "Laugh", "laugh" }, { "Cheer", "cheer" }, { "Stop", "stop" }, { "Mirror", "__mirror" },
 	{ "Sword", "__sword" }, { "Swing", "__swing" }, { "Skin: Classic", "__skin" },
-	{ "Spy: Off", "__spy" },
+	{ "Spy: Off", "__spy" }, { "Spider: Off", "__spider" },
 }
 
 for i, b in ipairs(BUTTONS) do
@@ -1131,6 +1327,7 @@ for i, b in ipairs(BUTTONS) do
 	if b[2] == "__mirror" then mirrorBtn = btn end
 	if b[2] == "__sword" then swordBtn = btn end
 	if b[2] == "__spy" then spyBtn = btn end
+	if b[2] == "__spider" then spiderBtn = btn end
 	btn.MouseButton1Click:Connect(function()
 		if b[2] == "__mirror" then
 			if piloting then return end
@@ -1145,6 +1342,8 @@ for i, b in ipairs(BUTTONS) do
 			btn.Text = "Skin: " .. SKINS[skinIdx].name
 		elseif b[2] == "__spy" then
 			setSpy(spyLevel + 1)
+		elseif b[2] == "__spider" then
+			setSpider(not spiderOn)
 		else
 			playCat(b[2])
 		end
@@ -1195,8 +1394,9 @@ _G.R6Rig_Stop = function()
 	for _, p in pairs(serverParts) do rm[#rm + 1] = p end
 	if swordBlade then rm[#rm + 1] = swordBlade end
 	if tessParts then for _, e in ipairs(tessParts) do if e.sp then rm[#rm + 1] = e.sp end end end
+	for _, p in ipairs(spiderServer) do rm[#rm + 1] = p end
 	if #rm > 0 then pcall(function() ep:InvokeServer("Remove", rm) end) end
 	print("[rig] stopped")
 end
 
-print("[rig] running — PILOT to drive (stays put when you stop) | Noob size slider | _G.R6Rig_Stop()")
+print("[rig] running — PILOT to drive | Spider / Spy / Skin buttons | Noob slider | _G.R6Rig_Stop()")
