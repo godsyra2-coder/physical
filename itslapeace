@@ -44,6 +44,15 @@ local EscalateEvent   = ReplicatedStorage.raidRoleplay.Events.EscalateEvent
 local PartOwnership   = ReplicatedStorage.raidRoleplay.Modules.PartOwnership
 local PropertyChanged = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("PropertyChanged")
 
+--// best-effort: turn CastShadow off on a server part (exact PropertyChanged signature unknown).
+--// fully-transparent parts don't cast shadows anyway, so spy mode is the reliable cover fix.
+local CAST_TOKEN = "PAhcHfXvb2sNMKoxt4y4betUjELnMfCf4G5DRHruMSAkAm6Bgx"
+local function castShadowOff(p)
+	if not PropertyChanged then return end
+	pcall(function() PropertyChanged:FireServer(p, "CastShadow", false) end)
+	pcall(function() PropertyChanged:FireServer(p, "CastShadow", false, CAST_TOKEN) end)
+end
+
 --// ---------- R6 spec ----------
 local YELLOW = Color3.fromRGB(245, 205, 48)
 local BLUE   = Color3.fromRGB(13, 105, 172)
@@ -218,9 +227,7 @@ do
 								Scale = Vector3.new(MESH_SCALE, MESH_SCALE, MESH_SCALE) } })
 						end
 						ep:InvokeServer("SyncAnchor",    { [1] = { Part = part, Anchored = true } })
-						if PropertyChanged then
-							pcall(function() PropertyChanged:FireServer(part, "CastShadow", false) end)  -- ⚠ signature guessed: (part, prop, value)
-						end
+						castShadowOff(part)
 						serverParts[s.name] = part
 					end
 				end
@@ -250,6 +257,10 @@ end
 local mode = "anim"      -- "anim" | "mirror"
 local piloting = false
 local pilotEmote = false  -- an emote is playing during pilot; suspends the walk/idle state machine
+local spyLevel = 0        -- 0 off | 1 hide tesseract | 2 also ghost the body 50%
+local tessHidden = false
+local setSpy              -- defined after the sword/tesseract are built
+local mobileJumpGui       -- touch JUMP button (the native one hides when we zero the real char's jump)
 local currentTrack, autoState
 local trackCache = {}
 
@@ -371,6 +382,7 @@ local function setPilot(on)
 		pilotBtn.BackgroundColor3 = on and Color3.fromRGB(190, 95, 60) or Color3.fromRGB(46, 46, 56)
 		pilotBtn.Text = on and "PILOT: ON  (Esc-btn to stop)" or "PILOT"
 	end
+	if mobileJumpGui then mobileJumpGui.Enabled = on end
 end
 _G.R6Rig_Pilot = setPilot
 
@@ -606,6 +618,7 @@ local function applySkin(i)
 				pcall(invoke, ep, "SyncMaterial", { [1] = { Part = sp, Material = mat, Transparency = sk.trans or 0, Reflectance = sk.reflect or 0 } })
 			end)
 		end
+		if setSpy and spyLevel > 0 then task.wait(0.05); setSpy(spyLevel) end   -- re-assert spy over the new skin
 	end)
 end
 _G.R6Rig_Skin = applySkin
@@ -666,7 +679,7 @@ do
 
 	local ra, rb = 0, 0
 	RunService.RenderStepped:Connect(function(dt)
-		if not alive then return end
+		if not alive or tessHidden then return end
 		ra += dt * 0.9;  rb += dt * 0.55
 		projectAll(ra, rb)
 		local head = localParts.Head
@@ -681,6 +694,7 @@ do
 			e.len = len
 			e.lp.Size = Vector3.new(THICK, THICK, len)
 			e.lp.CFrame = hubCF * CFrame.lookAt((A + B) * 0.5, (A + B) * 0.5 + d, up)
+			e.lp.CastShadow = false
 			if e.sp then e.sp.LocalTransparencyModifier = 1; e.sp.CastShadow = false end   -- hidden from yourself
 		end
 	end)
@@ -706,7 +720,7 @@ do
 			ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = Enum.MeshType.Brick,
 				Scale = Vector3.new(TX, TX, (e.len or 1) * MESH_SCALE) } })
 			ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
-			if PropertyChanged then pcall(function() PropertyChanged:FireServer(p, "CastShadow", false) end) end
+			castShadowOff(p)
 			e.sp = p
 		end)
 		task.wait(0.01)
@@ -714,7 +728,7 @@ do
 
 	local acc = 0
 	RunService.Heartbeat:Connect(function(dt)
-		if not alive then return end
+		if not alive or tessHidden then return end
 		acc += dt
 		if acc < 1 / 30 then return end       -- 30 Hz
 		acc = 0
@@ -824,7 +838,7 @@ local function buildSword()
 			MeshId = SWORD_MESH, TextureId = SWORD_TEX, Scale = Vector3.new(curScale, curScale, curScale) } })
 		ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Transparency = 1 } })   -- pooled: hidden
 		ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
-		if PropertyChanged then pcall(function() PropertyChanged:FireServer(p, "CastShadow", false) end) end
+		castShadowOff(p)
 		swordBlade = p
 		moveList[#moveList + 1] = { sp = p, lp = localSword }   -- streamed by the movement loop
 	end)
@@ -924,6 +938,71 @@ do  --// sword swing trail (client-only, coloured by skin)
 	swordTrail.Enabled = false
 	swordTrail.Parent = localSword
 end
+
+--// ---------- spy modes ----------
+--// 0 = off | 1 = hide the tesseract | 2 = also ghost the whole rig to 50% (harder to spot)
+setSpy = function(lvl)
+	spyLevel = lvl % 3
+	local hideTess = spyLevel >= 1
+	local ghost    = spyLevel >= 2
+	tessHidden = hideTess
+
+	if tessParts then
+		for _, e in ipairs(tessParts) do
+			e.lp.Transparency = hideTess and 1 or 0
+			e.lp.CastShadow = false
+		end
+		task.spawn(function()
+			local t = {}
+			for _, e in ipairs(tessParts) do if e.sp then t[#t + 1] = { Part = e.sp, Transparency = hideTess and 1 or 0 } end end
+			if #t > 0 then pcall(invoke, ep, "SyncMaterial", t) end
+		end)
+	end
+	glow.Enabled = (not hideTess) and (SKINS[skinIdx].glow ~= nil)
+
+	local baseT = SKINS[skinIdx].trans or 0
+	local bodyT = ghost and 0.5 or baseT
+	for _, s in ipairs(RIG) do
+		if s.name ~= "HumanoidRootPart" then localParts[s.name].Transparency = bodyT end
+	end
+	if localSword then localSword.Transparency = swordOn and (ghost and 0.5 or 0) or 1 end
+	task.spawn(function()
+		local t = {}
+		for _, sp in pairs(serverParts) do t[#t + 1] = { Part = sp, Transparency = bodyT } end
+		if swordBlade and swordOn then t[#t + 1] = { Part = swordBlade, Transparency = ghost and 0.5 or 0 } end
+		if #t > 0 then pcall(invoke, ep, "SyncMaterial", t) end
+	end)
+
+	if spyBtn then
+		spyBtn.Text = ({ [0] = "Spy: Off", [1] = "Spy: On", [2] = "Spy: Max" })[spyLevel]
+		spyBtn.BackgroundColor3 = spyLevel == 0 and Color3.fromRGB(46, 46, 56) or Color3.fromRGB(92, 74, 140)
+	end
+end
+_G.R6Rig_Spy = setSpy
+
+if UIS.TouchEnabled then   --// mobile JUMP button (native one is hidden while piloting)
+	mobileJumpGui = Instance.new("ScreenGui")
+	mobileJumpGui.Name = "R6RigJump"
+	mobileJumpGui.ResetOnSpawn = false
+	mobileJumpGui.IgnoreGuiInset = true
+	mobileJumpGui.Enabled = false
+	pcall(function() mobileJumpGui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+	if not mobileJumpGui.Parent then mobileJumpGui.Parent = plr:WaitForChild("PlayerGui") end
+
+	local jb = Instance.new("TextButton")
+	jb.Size = UDim2.fromOffset(96, 96)
+	jb.Position = UDim2.new(1, -120, 1, -132)
+	jb.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+	jb.BackgroundTransparency = 0.3
+	jb.Text = "JUMP"
+	jb.TextColor3 = Color3.fromRGB(240, 240, 245)
+	jb.Font = Enum.Font.GothamBold
+	jb.TextSize = 15
+	jb.Parent = mobileJumpGui
+	Instance.new("UICorner", jb).CornerRadius = UDim.new(1, 0)
+	jb.MouseButton1Down:Connect(function() if piloting then hum.Jump = true end end)
+end
+
 applySkin(1)
 
 --// ---------- GUI ----------
@@ -1034,6 +1113,7 @@ local BUTTONS = {
 	{ "Point", "point" }, { "Dance", "dance" }, { "Dance 2", "dance2" }, { "Dance 3", "dance3" },
 	{ "Laugh", "laugh" }, { "Cheer", "cheer" }, { "Stop", "stop" }, { "Mirror", "__mirror" },
 	{ "Sword", "__sword" }, { "Swing", "__swing" }, { "Skin: Classic", "__skin" },
+	{ "Spy: Off", "__spy" },
 }
 
 for i, b in ipairs(BUTTONS) do
@@ -1050,6 +1130,7 @@ for i, b in ipairs(BUTTONS) do
 	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
 	if b[2] == "__mirror" then mirrorBtn = btn end
 	if b[2] == "__sword" then swordBtn = btn end
+	if b[2] == "__spy" then spyBtn = btn end
 	btn.MouseButton1Click:Connect(function()
 		if b[2] == "__mirror" then
 			if piloting then return end
@@ -1062,6 +1143,8 @@ for i, b in ipairs(BUTTONS) do
 		elseif b[2] == "__skin" then
 			applySkin(skinIdx + 1)
 			btn.Text = "Skin: " .. SKINS[skinIdx].name
+		elseif b[2] == "__spy" then
+			setSpy(spyLevel + 1)
 		else
 			playCat(b[2])
 		end
@@ -1106,6 +1189,7 @@ _G.R6Rig_Stop = function()
 	if piloting then setPilot(false) end
 	stopTrack()
 	if gui then gui:Destroy() end
+	if mobileJumpGui then mobileJumpGui:Destroy() end
 	if localModel then localModel:Destroy() end
 	local rm = {}
 	for _, p in pairs(serverParts) do rm[#rm + 1] = p end
