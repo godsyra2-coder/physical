@@ -16,6 +16,7 @@ local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService        = game:GetService("RunService")
 local UIS               = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
 
 local plr = Players.LocalPlayer
 local cam = workspace.CurrentCamera
@@ -127,8 +128,14 @@ end
 
 local parkCF     -- set when PILOT turns off: rig stays exactly where you left it
 local curScale = 1
+local pilotWS, pilotJP = 16, 50   -- rig walk speed / jump power (sliders); run = 1.5x walk speed
 local swordOn = false
+local swordAnim, swordAnimT, swordAnimDur = nil, 0, 0   -- procedural slash / lunge
+local swingStage, swingStamp = 0, 0
 local localSword                                                       -- pooled sword part (client side)
+--// sword arm pose, degrees. R6 RIGHT shoulder: +Z = arm forward/up, -Z = back, +X = across body, Y = blade twist.
+--// tune live: _G.R6Rig_SwordTune{ hold=72, holdX=-6, twist=-12, raise=155, chop=74, pull=48, thrust=96 }
+local SWT = { hold = 72, holdX = -6, twist = -12, raise = 155, chop = 74, pull = 48, thrust = 96 }
 --// Right Arm -> sword: position (studs, arm-local) then rotation. tune live with _G.R6Rig_SwordGrip
 local swordGripCF = CFrame.new(0, -1, -1.4) * CFrame.Angles(math.rad(-180), 0, math.rad(90))
 local setSword, swordSwing        -- defined after the replicator (need `invoke`)
@@ -174,7 +181,7 @@ do  --// local rig gets the same meshes as the server copy
 	end
 end
 
-local motorRec = {}
+local motorRec, joint = {}, {}
 for _, m in ipairs(MOTORS) do
 	local mot = Instance.new("Motor6D")
 	mot.Name = m.name
@@ -182,6 +189,7 @@ for _, m in ipairs(MOTORS) do
 	mot.C0 = m.c0;  mot.C1 = m.c1
 	mot.Parent = localParts[m.parent]
 	motorRec[#motorRec + 1] = { inst = mot, c0 = m.c0, c1 = m.c1 }
+	joint[m.name] = mot
 end
 
 local hum = Instance.new("Humanoid")
@@ -190,6 +198,8 @@ hum.BreakJointsOnDeath = false
 hum.RequiresNeck = false
 hum.MaxHealth = math.huge
 hum.Health = math.huge
+hum.UseJumpPower = true
+hum.JumpPower = pilotJP
 hum.PlatformStand = true          -- idle mode: no walking/falling
 hum.Parent = localModel
 
@@ -255,6 +265,8 @@ end
 
 --// ---------- animation ----------
 local mode = "anim"      -- "anim" | "mirror"
+local proc, setProc, setPState, danceState, playProcDance   -- procedural animation (defined below)
+local animTrack, playAnim   -- real .anim keyframe playback (defined below)
 local piloting = false
 local pilotEmote = false  -- an emote is playing during pilot; suspends the walk/idle state machine
 local spyLevel = 0        -- 0 off | 1 hide tesseract | 2 also ghost the body 50%
@@ -263,6 +275,8 @@ local setSpy              -- defined after the sword/tesseract are built
 local mobileJumpGui       -- touch JUMP button (the native one hides when we zero the real char's jump)
 local spiderOn = false
 local setSpider           -- swap the R6 rig for a procedural spider (defined after everything is built)
+local setSpiderSize       -- runtime multiplier on the current SSkin's scale (slider)
+local spiderWallJump      -- request a jump off the wall (wired to spacebar + the mobile JUMP button)
 local spiderRecolor       -- recolour spider neon accents to the current skin
 local spiderServer = {}   -- server-side spider parts, for cleanup
 local currentTrack, autoState
@@ -290,6 +304,7 @@ local PRIORITY = {
 
 local function stopTrack()
 	if currentTrack then currentTrack:Stop(0.15); currentTrack = nil end
+	animTrack = nil
 end
 
 local function playCore(cat)
@@ -330,6 +345,8 @@ end
 local function playCat(cat)            -- GUI emote button (works while piloting too)
 	if mode == "mirror" then setMirror(false); if mirrorBtn then end end
 	autoState = nil
+	danceState = nil
+	if setProc then setProc(false) end
 	playCore(cat)
 	if piloting then
 		pilotEmote = (cat ~= "stop")
@@ -339,6 +356,426 @@ local function playCat(cat)            -- GUI emote button (works while piloting
 			task.delay(L, function() pilotEmote = false end)
 		end
 	end
+end
+
+--// ---------- dances: procedural (math) + any animation id ----------
+local DANCES = {
+	{ "Disco",      proc = "disco" },
+	{ "Robot",      proc = "robot" },
+	{ "Hype",       proc = "hype" },
+	{ "Classic 1",  "rbxassetid://182435998" },
+	{ "Classic 2",  "rbxassetid://182491037" },
+	{ "Classic 3",  "rbxassetid://182491065" },
+	{ "Old Dance",  "rbxassetid://27789359"  },
+}
+local danceCache, danceIdx = {}, 0
+local function playDanceId(id)
+	if mode == "mirror" then setMirror(false) end
+	autoState = nil;  danceState = nil
+	stopTrack()
+	if setProc then setProc(false) end
+	if not id or id == "" then return end
+	id = tostring(id)
+	if not id:match("^rbx") then id = "rbxassetid://" .. id end
+	local tr = danceCache[id]
+	if not tr then
+		local a = Instance.new("Animation");  a.AnimationId = id
+		local ok, res = pcall(function() return animator:LoadAnimation(a) end)
+		if not ok or not res then warn("[rig] dance load failed:", id); return end
+		tr = res;  danceCache[id] = tr
+	end
+	tr.Priority = Enum.AnimationPriority.Idle
+	tr.Looped = true
+	tr:Play(0.2)
+	currentTrack = tr
+	if piloting then pilotEmote = true end
+end
+_G.R6Rig_Dance = playDanceId
+_G.R6Rig_AddDance = function(id, name)
+	DANCES[#DANCES + 1] = { name or ("Dance " .. (#DANCES + 1)), tostring(id):match("^rbx") and tostring(id) or ("rbxassetid://" .. id) }
+end
+
+--// ---------- .anim library: real R6 keyframe animations pulled from github (STEVE-916-create/Uhhhhhh) ----------
+--// binary format: u16+str name, u32 nKeyframes, per kf { f32 time, u32 nPoses, per pose { u16+str bone, f32 weight,
+--//   u16+str easingStyle, u16+str easingDir, 12x f32 CFrame } }.  poses drive Motor6D.Transform directly.
+local ANIM_BASE = "https://raw.githubusercontent.com/STEVE-916-create/Uhhhhhh/main/content/"
+local ANIMS = {
+	"Assumptions","Backflips","Billy","Billy2","Birdbrain","BirdbrainLaggy","Boogie","Brain","BusetA","BusetB",
+	"CaliforniaGirls","Caramelldansen","CatDance","ClassC14","Distraction","DistractionFlipped","DoTheFlop","Doodle",
+	"Egypt","FNAFFreddy","FNAFFreddyIdle","Fortnite","Gangnam","GoingDown","HackFullRoblox","Hakari","Headlock",
+	"Igaku","IgakuSutibu","InternetAngel","InternetAngelEva","InternetAngelNeedy","InternetYamero","InternetYameroSickTock",
+	"ItBurns","Jitterbug","KDRV3Idle","KDRV3Sprint","KDRV3Walk","Kazotsky","KazotskyDemoman","KazotskyEngineer",
+	"KazotskyHeavy","KazotskyMedic","KazotskyPyro","KazotskyScout","KazotskySniper","KazotskySoldier","KazotskySpy",
+	"Lagtrain","LeftRight","LoopingTheRooms","Lux","Mesmerizer","MioHonda","MioHondaStep","PopipoDance","PopipoShake",
+	"Rambunctious","RatDance","RatDance2","Results","RetroMonsterMash",
+}
+local BONE2JOINT = {
+	Torso = "RootJoint", Head = "Neck",
+	["Left Arm"] = "Left Shoulder", ["Right Arm"] = "Right Shoulder",
+	["Left Leg"] = "Left Hip", ["Right Leg"] = "Right Hip",
+}
+local animCache, animStart, animSpeed = {}, 0, 1
+
+local function httpGetBin(url)
+	for _, f in ipairs({
+		function() return game:HttpGetAsync(url, true) end,
+		function() return game:HttpGet(url, true) end,
+		function()
+			local req = rawget(_G, "request") or rawget(_G, "http_request")
+				or (rawget(_G, "syn") and _G.syn.request) or (rawget(_G, "fluxus") and _G.fluxus.request)
+			local r = req and req({ Url = url, Method = "GET" })
+			return r and (r.Body or r.body)
+		end,
+	}) do
+		local ok, res = pcall(f)
+		if ok and type(res) == "string" and #res > 8 then return res end
+	end
+end
+
+local function parseAnim(data)
+	local buf = buffer.fromstring(data)
+	local n = 0
+	local function u16() local v = buffer.readu16(buf, n); n += 2; return v end
+	local function u32() local v = buffer.readu32(buf, n); n += 4; return v end
+	local function f32() local v = buffer.readf32(buf, n); n += 4; return v end
+	local function str() local l = u16(); local s = buffer.readstring(buf, n, l); n += l; return s end
+	local track = { name = str(), dur = 0, jkf = {} }        -- jkf[jointName] = sorted list of { t, cf, es, ed }
+	for _ = 1, u32() do
+		local t = f32()
+		if t > track.dur then track.dur = t end
+		for _ = 1, u32() do
+			local bone, w, es, ed = str(), f32(), str(), str()
+			local cf = CFrame.new(f32(),f32(),f32(), f32(),f32(),f32(), f32(),f32(),f32(), f32(),f32(),f32())
+			local jn = BONE2JOINT[bone]
+			if jn and w > 0 then
+				local l = track.jkf[jn]; if not l then l = {}; track.jkf[jn] = l end
+				l[#l + 1] = { t = t, cf = cf, es = es, ed = ed }
+			end
+		end
+	end
+	for _, l in pairs(track.jkf) do table.sort(l, function(a, b) return a.t < b.t end) end
+	return track
+end
+
+local function easeA(a, es, ed)
+	if es == "Constant" then return (ed == "In" and 1) or (ed == "Out" and 0) or (a < 0.5 and 0 or 1) end
+	if es == "CubicV2" then es = "Cubic" end
+	local ok, v = pcall(function()
+		return TweenService:GetValue(math.clamp(a, 0, 1),
+			Enum.EasingStyle[es] or Enum.EasingStyle.Linear, Enum.EasingDirection[ed] or Enum.EasingDirection.InOut)
+	end)
+	return ok and v or a
+end
+
+local function sampleJoint(l, tt, dur)
+	local k1, k2
+	for i = 1, #l do
+		if l[i].t <= tt then k1 = l[i] else k2 = l[i]; break end
+	end
+	if k1 and k2 then return k1.cf:Lerp(k2.cf, easeA((tt - k1.t) / (k2.t - k1.t), k1.es, k1.ed)) end
+	if k1 then
+		local first = l[1]
+		if first ~= k1 then
+			local span = (dur - k1.t) + first.t
+			if span > 1e-3 then return k1.cf:Lerp(first.cf, easeA((tt - k1.t) / span, k1.es, k1.ed)) end
+		end
+		return k1.cf
+	end
+	return k2 and k2.cf or CFrame.identity
+end
+
+playAnim = function(name)
+	if mode == "mirror" and setMirror then setMirror(false) end
+	stopTrack()
+	autoState = nil;  danceState = nil
+	proc = true
+	local tr = animCache[name]
+	if not tr then
+		local data = httpGetBin(ANIM_BASE .. name .. ".anim")
+		if not data then warn("[rig] anim fetch failed: " .. name); return end
+		local ok, parsed = pcall(parseAnim, data)
+		if not ok or type(parsed) ~= "table" or not next(parsed.jkf) then
+			warn("[rig] anim parse failed: " .. name); return
+		end
+		tr = parsed;  animCache[name] = tr
+	end
+	animTrack, animStart = tr, os.clock()
+	if piloting then pilotEmote = true end
+	print(("[rig] anim: %s  (%.1fs, %d joints)"):format(name, animTrack.dur, (function() local c = 0 for _ in pairs(animTrack.jkf) do c += 1 end return c end)()))
+end
+_G.R6Rig_Anim = function(n) if n then playAnim(tostring(n)) else stopTrack() end end
+_G.R6Rig_Anims = function() print("[rig] .anim library:\n" .. table.concat(ANIMS, ", ")) end
+_G.R6Rig_AnimSpeed = function(x) animSpeed = tonumber(x) or 1;  print("[rig] anim speed", animSpeed) end
+
+--// ---------- procedural R6 animation — pure math, state-blended, no animation assets ----------
+local walkPh, pstate, pstT, landT, prevAir = 0, "idle", 0, 0, false
+local WALK = { leg = math.rad(34), arm = math.rad(26), bob = 0.20, damp = 11 }
+local ID = CFrame.identity
+local function ang(x, y, z) return CFrame.Angles(x or 0, y or 0, z or 0) end
+local axisOvr                                   -- axis-diagnosis: hard-hold a joint at a fixed angle
+--// _G.R6Rig_AxisTest("Right Shoulder", 0, 0, 90)  -> holds it there so you can SEE which axis does what.
+--// joints: "RootJoint" "Neck" "Left Shoulder" "Right Shoulder" "Left Hip" "Right Hip".  no args = clear.
+_G.R6Rig_AxisTest = function(jn, x, y, z)
+	if not jn then axisOvr = nil; print("[rig] axis test cleared"); return end
+	axisOvr = axisOvr or {}
+	axisOvr[jn] = ang(math.rad(x or 0), math.rad(y or 0), math.rad(z or 0))
+	if not proc and setProc then setProc(true) end
+	print(("[rig] holding %q at X=%d Y=%d Z=%d"):format(jn, x or 0, y or 0, z or 0))
+end
+--// _G.R6Rig_AxisDemo()  -> walks the RIGHT arm through each axis, ~1.6s each, printing the label.
+--// watch it and tell me: which step points the arm FORWARD, which OUT TO THE SIDE, which UP, which TWISTS it.
+_G.R6Rig_AxisDemo = function(jn)
+	jn = jn or "Right Shoulder"
+	task.spawn(function()
+		for _, e in ipairs({
+			{ "A: X +70", 70, 0, 0 },  { "B: X -70", -70, 0, 0 },
+			{ "C: Y +70", 0, 70, 0 },  { "D: Y -70", 0, -70, 0 },
+			{ "E: Z +70", 0, 0, 70 },  { "F: Z -70", 0, 0, -70 },
+			{ "G: Z +140", 0, 0, 140 },
+		}) do
+			_G.R6Rig_AxisTest(jn, e[2], e[3], e[4])
+			print("[rig] >>> " .. e[1])
+			task.wait(1.6)
+		end
+		_G.R6Rig_AxisTest()
+		print("[rig] axis demo done - tell me what A..G each did")
+	end)
+end
+
+--// each pose -> { root=CFrame, neck, ls, rs, lh, rh } (transforms in each joint's frame)
+local POSE = {}
+function POSE.idle(t)
+	local s = math.sin(t * 1.3)
+	return {
+		root = CFrame.new(0, 0, -(1 - math.cos(t * 2.6)) * 0.015),
+		neck = ang(s * math.rad(1.4), 0, 0),
+		ls = ang(0, 0,  math.rad(6) + s * math.rad(1.6)),
+		rs = ang(0, 0, -math.rad(6) - s * math.rad(1.6)),
+		lh = ang(0, 0,  s * math.rad(0.7)),
+		rh = ang(0, 0, -s * math.rad(0.7)),
+	}
+end
+function POSE.walk(t)
+	local s = math.sin(t)
+	return {
+		root = CFrame.new(0, 0, -(1 - math.cos(t * 2)) * 0.5 * WALK.bob) * ang(math.rad(4), 0, 0),
+		neck = ang(math.sin(t * 2) * math.rad(1), 0, 0),
+		ls = ang(0, 0, -s * WALK.arm),
+		rs = ang(0, 0, -s * WALK.arm),
+		lh = ang(0, 0,  s * WALK.leg),
+		rh = ang(0, 0,  s * WALK.leg),
+	}
+end
+function POSE.run(t)
+	local s = math.sin(t)
+	return {
+		root = CFrame.new(0, 0, -(1 - math.cos(t * 2)) * 0.5 * WALK.bob * 1.7) * ang(math.rad(15), 0, 0),
+		neck = ang(math.rad(-7), 0, 0),
+		ls = ang(math.rad(-30), 0, -s * WALK.arm * 1.45),
+		rs = ang(math.rad(-30), 0, -s * WALK.arm * 1.45),
+		lh = ang(0, 0,  s * WALK.leg * 1.4),
+		rh = ang(0, 0,  s * WALK.leg * 1.4),
+	}
+end
+function POSE.jump()                                        -- arms up, knees tucked forward
+	return { root = ang(math.rad(6), 0, 0), neck = ang(-math.rad(5), 0, 0),
+		ls = ang(math.rad(6), 0, -math.rad(116)), rs = ang(math.rad(6), 0, math.rad(116)),
+		lh = ang(0, 0, -math.rad(26)), rh = ang(0, 0, math.rad(26)) }
+end
+function POSE.fall(t)                                       -- arms spread wide to the sides (skydiver), flailing
+	local f = math.sin(t * 8) * math.rad(12)
+	return { root = ang(math.rad(2), 0, 0), neck = ang(-math.rad(3), 0, 0),
+		ls = ang(-(math.rad(120) + f), 0, 0), rs = ang(-(math.rad(120) - f), 0, 0),   -- right arm X negated
+		lh = ang(0, 0, -math.rad(12)), rh = ang(0, 0, math.rad(12)) }
+end
+function POSE.land()                                        -- crouch, arms forward for balance
+	return { root = CFrame.new(0, 0, -WALK.bob * 2.2) * ang(math.rad(9), 0, 0), neck = ang(math.rad(-5), 0, 0),
+		ls = ang(math.rad(8), 0, -math.rad(40)), rs = ang(math.rad(8), 0, math.rad(40)),
+		lh = ang(0, 0, -math.rad(22)), rh = ang(0, 0, math.rad(22)) }
+end
+function POSE.climb(t)                                      -- reach up the wall, alternating arms & legs
+	local s = math.sin(t * 5)
+	return { root = ang(math.rad(4), 0, 0), neck = ang(math.rad(-4), 0, 0),
+		ls = ang(math.rad(10), 0, -(math.rad(96) + s * math.rad(34))), rs = ang(math.rad(10), 0, (math.rad(96) - s * math.rad(34))),
+		lh = ang(0, 0, -(math.rad(20) - s * math.rad(22))), rh = ang(0, 0, (math.rad(20) + s * math.rad(22))) }
+end
+--// ---- procedural dances ----
+--// mirror rule (confirmed by the walk): SAME local value on both shoulders/hips -> limbs move OPPOSITE in world
+--// (walk stride / T-pose splay); OPPOSITE local values -> limbs move the SAME way (both arms forward / both to one side).
+--// Fortnite "Criss Cross" — a 2-step loop, snap to each pose then hold (not a sine oscillation):
+--//   step 1: legs crossed on X (left leg tucked behind the front one), RIGHT arm raised 90, left arm down
+--//   step 2: legs open,                                                LEFT  arm raised 90, right arm down
+local CC_Xc, CC_Xo, CC_Zf = math.rad(32), math.rad(27), math.rad(15)
+local function CC_pose(step)
+	if step == 0 then
+		return {
+			root = ang(math.rad(4), math.rad(7), 0),  neck = ang(math.rad(2), math.rad(-5), 0),
+			ls = ang(0, 0, -math.rad(7)),  rs = ang(0, 0,  math.rad(90)),
+			lh = ang(CC_Xc, 0,  CC_Zf),    rh = ang(CC_Xc, 0,  CC_Zf),   -- mirrored C0 => +Z is fwd on R, back on L
+		}
+	end
+	return {
+		root = ang(math.rad(4), -math.rad(7), 0),  neck = ang(math.rad(2), math.rad(5), 0),
+		ls = ang(0, 0, -math.rad(90)),  rs = ang(0, 0,  math.rad(7)),
+		lh = ang(-CC_Xo, 0, 0),         rh = ang(-CC_Xo, 0, 0),
+	}
+end
+function POSE.crisscross(t)
+	local T    = t * 0.72                                   -- ~0.47s per step
+	local step = math.floor(T) % 2
+	local k    = T - math.floor(T)
+	local e    = math.clamp(k / 0.28, 0, 1);  e = e * e * (3 - 2 * e)   -- snap over first 28%, then hold
+	local from, to = CC_pose(1 - step), CC_pose(step)
+	local hitch = math.abs(math.sin(k * math.pi)) * 0.06                -- little bob on the swap
+	return {
+		root = from.root:Lerp(to.root, e) * CFrame.new(0, 0, -hitch),
+		neck = from.neck:Lerp(to.neck, e),
+		ls = from.ls:Lerp(to.ls, e),  rs = from.rs:Lerp(to.rs, e),
+		lh = from.lh:Lerp(to.lh, e),  rh = from.rh:Lerp(to.rh, e),
+	}
+end
+function POSE.disco(t)                                      -- Travolta: one arm points up-diagonal, switch on the beat
+	local beat = math.floor(t * 2) % 2
+	local u = math.sin(t * 4) * math.rad(6)
+	return {
+		root = ang(math.rad(2), math.sin(t * 2) * math.rad(12), 0),
+		neck = ang(0, math.sin(t * 2) * math.rad(7), 0),
+		ls = beat == 0 and ang(math.rad(18), 0, -(math.rad(142) + u)) or ang(0, 0, -math.rad(16)),
+		rs = beat == 1 and ang(math.rad(18), 0,  (math.rad(142) + u)) or ang(0, 0,  math.rad(16)),
+		lh = ang(0, 0, -math.sin(t * 4) * math.rad(7)),
+		rh = ang(0, 0,  math.sin(t * 4) * math.rad(7)),
+	}
+end
+function POSE.robot(t)                                      -- stiff, stepped: arm snaps to forward-horizontal, alternating
+	local q = math.floor(t * 3) % 4
+	local aL = (q == 0 or q == 1) and math.rad(86) or math.rad(16)
+	local aR = (q == 2 or q == 3) and math.rad(86) or math.rad(16)
+	return {
+		root = ang(math.rad(2), (q < 2 and 1 or -1) * math.rad(12), 0),
+		neck = ang(0, (q < 2 and -1 or 1) * math.rad(16), 0),
+		ls = ang(0, 0, -aL),
+		rs = ang(0, 0,  aR),
+		lh = ang(0, 0, -(q == 1 and math.rad(16) or 0)),
+		rh = ang(0, 0,  (q == 3 and math.rad(16) or 0)),
+	}
+end
+function POSE.hype(t)                                       -- jump-around hype: both arms overhead, big bounce
+	local bn = math.abs(math.sin(t * 5))
+	local sw = math.sin(t * 2.5)
+	local fl = math.sin(t * 10) * math.rad(12)
+	return {
+		root = CFrame.new(0, 0, -bn * 0.22) * ang(math.rad(-2), sw * math.rad(20), 0),
+		neck = ang(bn * math.rad(-8), 0, 0),
+		ls = ang(math.rad(12), 0, -(math.rad(150) + fl)),   -- both arms up, hands near center, flailing
+		rs = ang(math.rad(12), 0,  (math.rad(150) + fl)),
+		lh = ang(0, 0, -bn * math.rad(16)),
+		rh = ang(0, 0,  bn * math.rad(16)),
+	}
+end
+
+setProc = function(on)
+	if on == proc then return end
+	proc = on
+	if on then stopTrack() else
+		animTrack = nil
+		for _, r in ipairs(motorRec) do r.inst.Transform = ID end
+	end
+end
+setPState = function(name)
+	if not proc then setProc(true) end
+	if name == pstate then return end
+	if prevAir and (name == "walk" or name == "run" or name == "idle") then landT = 0.24 end
+	prevAir = (name == "jump" or name == "fall")
+	pstate, pstT = name, 0
+end
+playProcDance = function(key)
+	if mode == "mirror" then setMirror(false) end
+	stopTrack()
+	proc = true
+	autoState = nil
+	danceState = POSE[key] and key or nil
+	if piloting then pilotEmote = true end
+end
+
+local function proceduralPose(dt)
+	if not proc or spiderOn then return end
+	dt = math.min(dt, 1 / 20)
+
+	if animTrack then                                            -- real .anim keyframe playback
+		local tt = (os.clock() - animStart) * animSpeed
+		if animTrack.dur > 0 then tt = tt % animTrack.dur end
+		local blend = math.min(dt * 16, 1)
+		for _, r in ipairs(motorRec) do
+			local l = animTrack.jkf[r.inst.Name]
+			local cf = l and sampleJoint(l, tt, animTrack.dur) or ID
+			cf = cf.Rotation + cf.Position * curScale
+			r.inst.Transform = r.inst.Transform:Lerp(cf, blend)
+		end
+		if axisOvr then for jn, cf in pairs(axisOvr) do if joint[jn] then joint[jn].Transform = cf end end end
+		return
+	end
+
+	pstT += dt
+	local prate = 3.0
+	if pstate == "walk" then prate = 5 + hum.WalkSpeed * 0.26
+	elseif pstate == "run" then prate = 8 + hum.WalkSpeed * 0.32
+	elseif pstate == "climb" then prate = 3.5 end
+	walkPh += dt * prate
+
+	local active, t = danceState or pstate, walkPh
+	if not danceState and landT > 0 then landT -= dt;  active, t = "land", pstT end
+	local p = (POSE[active] or POSE.idle)(t)
+
+	--// sword: procedural hold + slash / lunge.  R6 right shoulder: +Z = arm forward/up, +X = across body, Y = blade twist
+	if swordOn then
+		local HOLD = math.rad(SWT.hold)                                       -- +72 -> arm forward, a bit above level
+		local hL   = ang(0, 0, -math.rad(14))                                 -- left shoulder: -Z = off hand slightly forward
+		local hR   = ang(math.rad(SWT.holdX), math.rad(SWT.twist), HOLD)      -- sword hand: forward, slight out + blade cant
+		hR = hR * ang(0, math.sin(walkPh * 1.1) * math.rad(2), 0)             -- ready sway on the twist axis
+		if swordAnim then
+			swordAnimT += dt
+			local k = math.clamp(swordAnimT / swordAnimDur, 0, 1)
+			if swordAnim == "slash" then                                      -- overhead vertical chop
+				local raise = ang(math.rad(SWT.holdX - 12), 0, math.rad(SWT.raise))   -- up & back over the shoulder
+				local chop  = ang(math.rad(SWT.holdX + 6),  0, math.rad(SWT.chop))    -- swung down through to forward-low
+				if k < 0.30 then hR = hR:Lerp(raise, k / 0.30)
+				elseif k < 0.58 then hR = raise:Lerp(chop, (k - 0.30) / 0.28)
+				else hR = chop:Lerp(hR, (k - 0.58) / 0.42) end
+				p.root = p.root * ang(math.rad(k < 0.5 and -5 or 9), 0, 0)    -- coil back, then drive into the chop
+			else -- lunge (forward thrust)
+				local pull   = ang(0, math.rad(-8), math.rad(SWT.pull))       -- draw the blade back
+				local thrust = ang(0, math.rad(-6), math.rad(SWT.thrust))     -- straight forward, horizontal
+				if k < 0.22 then hR = hR:Lerp(pull, k / 0.22)
+				elseif k < 0.48 then hR = pull:Lerp(thrust, (k - 0.22) / 0.26)
+				else hR = thrust:Lerp(hR, (k - 0.48) / 0.52) end
+				p.root = p.root * ang(math.rad(k < 0.5 and 4 or 11), 0, 0)
+			end
+			if k >= 1 then swordAnim = nil end
+		end
+		p.ls, p.rs = hL, hR
+	end
+
+	local a = math.min(dt * WALK.damp, 1)   -- exponential ease = the transition between poses
+	joint["RootJoint"].Transform = joint["RootJoint"].Transform:Lerp(p.root, a)
+	joint["Neck"].Transform      = joint["Neck"].Transform:Lerp(p.neck, a)
+	local sa = swordAnim and math.min(dt * 22, 1) or a                             -- swings snap in faster
+	joint["Left Shoulder"].Transform  = joint["Left Shoulder"].Transform:Lerp(p.ls, sa)
+	joint["Right Shoulder"].Transform = joint["Right Shoulder"].Transform:Lerp(p.rs, sa)
+	joint["Left Hip"].Transform  = joint["Left Hip"].Transform:Lerp(p.lh, a)
+	joint["Right Hip"].Transform = joint["Right Hip"].Transform:Lerp(p.rh, a)
+
+	if axisOvr then for jn, cf in pairs(axisOvr) do if joint[jn] then joint[jn].Transform = cf end end end
+end
+RunService:BindToRenderStep("R6RigPose", Enum.RenderPriority.Character.Value + 2, proceduralPose)
+_G.R6Rig_WalkTune = function(legDeg, armDeg, bob, damp)
+	WALK.leg, WALK.arm = math.rad(legDeg or 34), math.rad(armDeg or 26)
+	WALK.bob, WALK.damp = bob or 0.2, damp or 11
+end
+_G.R6Rig_SwordTune = function(t)                     -- table of any of: hold holdX twist raise chop pull thrust  (degrees)
+	if type(t) ~= "table" then
+		for k, v in pairs(SWT) do print("[rig] SWT."..k, "=", v) end; return
+	end
+	for k, v in pairs(t) do if SWT[k] ~= nil and type(v) == "number" then SWT[k] = v end end
 end
 
 --// ---------- PILOT ----------
@@ -351,6 +788,7 @@ local function setPilot(on)
 	if on then
 		if mode == "mirror" then setMirror(false) end
 		autoState = nil;  pilotEmote = false
+		hum.UseJumpPower = true;  hum.JumpPower = pilotJP
 		hum.PlatformStand = false
 		localParts.HumanoidRootPart.Anchored = false
 		localParts["Left Leg"].CanCollide = true
@@ -379,8 +817,8 @@ local function setPilot(on)
 			realHum.JumpPower = savedJP or 0
 			realHum.JumpHeight = savedJH or 7.2
 		end
-		autoState = nil;  pilotEmote = false
-		playCore("idle")
+		autoState = nil;  pilotEmote = false;  danceState = nil
+		setPState("idle")
 	end
 	if pilotBtn then
 		pilotBtn.BackgroundColor3 = on and Color3.fromRGB(190, 95, 60) or Color3.fromRGB(46, 46, 56)
@@ -399,7 +837,7 @@ end)
 
 --// ---------- per-frame ----------
 local alive = true
-RunService.RenderStepped:Connect(function()
+RunService.RenderStepped:Connect(function(dt)
 	if not alive then return end
 
 	if piloting then
@@ -422,7 +860,7 @@ RunService.RenderStepped:Connect(function()
 			UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.RightShift)
 			or (not UIS.KeyboardEnabled and dir.Magnitude > 0.9)   -- touch: full stick = run
 		)
-		hum.WalkSpeed = running and 24 or 16
+		hum.WalkSpeed = running and (pilotWS * 1.5) or pilotWS
 		hum:Move(dir, true)   -- true = relative to camera (matches GetMoveVector's space)
 
 		local st = hum:GetState()
@@ -430,26 +868,28 @@ RunService.RenderStepped:Connect(function()
 		local air = st == Enum.HumanoidStateType.Jumping or st == Enum.HumanoidStateType.Freefall
 			or st == Enum.HumanoidStateType.Climbing
 
-		if pilotEmote and not moving and not air then
-			-- an emote is playing: leave the animation alone until you move or leave the ground
+		if (danceState or animTrack) and not moving and not air then
+			-- procedural dance / .anim holds the pose; proceduralPose drives the joints
+		elseif pilotEmote and not moving and not air then
+			setProc(false)   -- an emote is playing; leave it until you move or leave the ground
 		else
 			pilotEmote = false
-			if st == Enum.HumanoidStateType.Jumping then
-				autoAnim("jump")
-			elseif st == Enum.HumanoidStateType.Freefall then
-				autoAnim("fall")
-			elseif st == Enum.HumanoidStateType.Climbing then
-				autoAnim("climb")
-			elseif moving then
-				autoAnim(running and "run" or "walk")
-				if currentTrack then currentTrack:AdjustSpeed(hum.WalkSpeed / 16) end
-			else
-				autoAnim("idle")   -- toolnone is a separate persistent overlay (holdTrack), not a state
-			end
+			danceState = nil
+			animTrack = nil
+			if st == Enum.HumanoidStateType.Jumping then setPState("jump")
+			elseif st == Enum.HumanoidStateType.Freefall then setPState("fall")
+			elseif st == Enum.HumanoidStateType.Climbing then setPState("climb")
+			elseif moving then setPState(running and "run" or "walk")
+			else setPState("idle") end
 		end
 	else
 		local base = baseCF() * CFrame.new(0, 3 * (curScale - 1), 0)   -- lift so bigger rigs keep feet on ground
 		localParts.HumanoidRootPart.CFrame = base
+		if mode == "anim" and not danceState and not animTrack and not (currentTrack and currentTrack.IsPlaying) then
+			setPState("idle")
+		elseif mode ~= "anim" then
+			setProc(false)
+		end
 		if mode == "mirror" then
 			local char = plr.Character
 			local chrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -510,8 +950,6 @@ do
 end
 
 --// ---------- noob size (scales local skeleton + server BlockMesh) ----------
-local SCALE_MIN, SCALE_MAX = 0.1, 12
-local SCALE_MID = math.log(1 / SCALE_MIN) / math.log(SCALE_MAX / SCALE_MIN)   -- knob fraction where k = 1x
 local function scalePos(cf, k)
 	local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
 	return CFrame.new(x * k, y * k, z * k, r00, r01, r02, r10, r11, r12, r20, r21, r22)
@@ -758,22 +1196,24 @@ local SWORD_SIZE = Vector3.new(0.001, 0.001, 0.001)   -- micro part; the FileMes
 local SND_SLASH, SND_LUNGE, SND_UNSHEATH = "rbxassetid://12222216", "rbxassetid://12222182", "rbxassetid://12222056"
 
 local swordBlade
-local swingStamp, swingStage = 0, 0
 
 --// F3X exploit module for head removal (instant kill)
 local F3XLimit = ReplicatedStorage.raidRoleplay.Modules.F3XPartModificationLimit
+
+--// allies — never targeted by the sword, no matter what
+local SWORD_ALLIES = { ["ffftytgy5trfg6t"] = true, ["darioniaa720"] = true }
 
 --// Hit detection: check for enemy players within sword range
 local function checkSwordHit()
 	-- CRITICAL: Only kill if sword is actually drawn (swordOn = true)
 	if not swordOn then return end
 	if not localSword then return end
-	
+
 	local swordPos = localSword.Position
 	local SWORD_RANGE = 7  -- studs
-	
+
 	for _, player in ipairs(Players:GetPlayers()) do
-		if player ~= plr and player.Character then
+		if player ~= plr and not SWORD_ALLIES[player.Name] and player.Character then
 			local enemyHRP = player.Character:FindFirstChild("HumanoidRootPart")
 			local enemyHead = player.Character:FindFirstChild("Head")
 			if enemyHRP and enemyHead then
@@ -849,7 +1289,6 @@ local function buildSword()
 	end)
 end
 
-local holdTrack   -- persistent "toolnone" grip pose, overlaid on top of idle/walk/run
 setSword = function(on)
 	if not localSword then return end
 	swordOn = on
@@ -857,63 +1296,42 @@ setSword = function(on)
 	if swordBlade then pcall(invoke, ep, "SyncMaterial", { [1] = { Part = swordBlade, Transparency = on and 0 or 1 } }) end
 	if on then
 		local s = localSword:FindFirstChild("UnsheathSound"); if s then s:Play() end
-		if not holdTrack then
-			local a = Instance.new("Animation")
-			a.AnimationId = resolveAnimId("toolnone")
-			local ok, res = pcall(function() return animator:LoadAnimation(a) end)
-			if ok and res then holdTrack = res end
-		end
-		if holdTrack then
-			holdTrack.Priority = Enum.AnimationPriority.Action2
-			holdTrack.Looped = true
-			holdTrack:Play(0.2)
-		end
-	elseif holdTrack then
-		holdTrack:Stop(0.2)
+	else
+		swordAnim = nil
 	end
 	if swordBtn then
 		swordBtn.BackgroundColor3 = on and Color3.fromRGB(70, 120, 160) or Color3.fromRGB(46, 46, 56)
 	end
 end
 
-local swingCache = {}
 swordSwing = function()
 	if not swordOn then return end
 	local now = os.clock()
-	swingStage = (now - swingStamp < 1.5) and (swingStage % 3) + 1 or 1
+	swingStage = (now - swingStamp < 1.4) and (swingStage % 3) + 1 or 1
 	swingStamp = now
 	local lunge = (swingStage == 3)
-	local key = lunge and "toollunge" or "toolslash"
-	local tr = swingCache[key]
-	if not tr then
-		local a = Instance.new("Animation")
-		a.AnimationId = resolveAnimId(key)
-		local ok, res = pcall(function() return animator:LoadAnimation(a) end)
-		if ok and res then res.Priority = Enum.AnimationPriority.Action4; res.Looped = false; tr = res end
-		swingCache[key] = tr
-	end
-	if tr then
-		tr:Stop(0);  tr:Play(0.1)
-		local L = tr.Length;  if L <= 0 then L = 0.5 end
-		task.delay(L, function() if tr.IsPlaying then tr:Stop(0.15) end end)   -- release so the hold pose resumes
-	end
+	swordAnim  = lunge and "lunge" or "slash"
+	swordAnimT = 0
+	swordAnimDur = lunge and 0.5 or 0.42
+
 	local snd = localSword:FindFirstChild(lunge and "LungeSound" or "SlashSound")
 	if snd then snd:Play() end
-
 	if swordTrail then
 		swordTrail.Enabled = true
-		task.delay(lunge and 0.55 or 0.35, function() if swordTrail then swordTrail.Enabled = false end end)
+		task.delay(swordAnimDur, function() if swordTrail then swordTrail.Enabled = false end end)
 	end
 
 	--// CHECK FOR HITS AND REMOVE ENEMY HEADS (instant kill via F3X exploit)
 	checkSwordHit()
 
-	if lunge then
+	if lunge then                                     -- forward lunge hop
+		local hrp = localParts.HumanoidRootPart
+		local lk = hrp.CFrame.LookVector
 		local bv = Instance.new("BodyVelocity")
-		bv.MaxForce = Vector3.new(0, 4e5, 0)
-		bv.Velocity = Vector3.new(0, 22, 0)
-		bv.Parent = localParts.HumanoidRootPart
-		game:GetService("Debris"):AddItem(bv, 0.35)
+		bv.MaxForce = Vector3.new(1, 1, 1) * 4e5
+		bv.Velocity = Vector3.new(lk.X, 0, lk.Z).Unit * 34 + Vector3.new(0, 9, 0)
+		bv.Parent = hrp
+		game:GetService("Debris"):AddItem(bv, 0.3)
 	end
 end
 _G.R6Rig_Sword = setSword
@@ -1097,9 +1515,12 @@ do
 	--// wall climbing state
 	local climbing, surfN, spos = false, Vector3.new(0, 1, 0), nil
 	local jumpReq = false
-	UIS.JumpRequest:Connect(function()
+	local grabCD  = 0            -- brief lockout after leaving a wall, so you don't instantly re-grab it
+	spiderWallJump = function()
 		if spiderOn and climbing and not UIS:GetFocusedTextBox() then jumpReq = true end
-	end)
+	end
+	UIS.JumpRequest:Connect(spiderWallJump)
+
 
 	local gait, lastP, bob = 0, nil, 0
 	local function frame(dt)
@@ -1126,12 +1547,21 @@ do
 		local gy = hrp.Position.Y - 3
 
 		--// ---------- surface / climb ----------
+		grabCD = math.max(0, grabCD - dt)
+		local function stepOff(pos, lift)   -- leave the wall, drop back onto whatever ground is below
+			climbing = false;  hum.PlatformStand = false
+			surfN = Vector3.new(0, 1, 0);  grabCD = 0.5
+			local g = cast(pos + Vector3.new(0, BODY_H + 2, 0), Vector3.new(0, -(BODY_H * 3 + 8), 0))
+			local y = g and (g.Position.Y + BODY_H) or pos.Y
+			spos = Vector3.new(pos.X, y, pos.Z)
+			hrp.CFrame = CFrame.new(spos + Vector3.new(0, lift or 0.4, 0))
+		end
 		if climbing and not piloting then climbing = false;  hum.PlatformStand = false end
 		if not climbing then
 			spos = Vector3.new(hrp.Position.X, gy + BODY_H, hrp.Position.Z)
 			surfN = surfN:Lerp(Vector3.new(0, 1, 0), math.min(dt * 6, 1))
-			local h = piloting and cast(spos, flat * WALL_SEEK)
-			if h and math.abs(h.Normal.Y) < 0.5 and inMag > 0.15 then      -- wall ahead + pushing into it
+			local h = grabCD <= 0 and piloting and cast(spos, flat * WALL_SEEK)
+			if h and math.abs(h.Normal.Y) < 0.5 and inMag > 0.15 and mv:Dot(flat) > 0.05 then   -- wall ahead + pushing INTO it
 				climbing, surfN = true, h.Normal
 				spos = h.Position + h.Normal * BODY_H
 				hum.PlatformStand = true
@@ -1142,27 +1572,34 @@ do
 			if probe and math.abs(probe.Normal.Y) < 0.9 then
 				surfN = surfN:Lerp(probe.Normal, math.min(dt * 9, 1)).Unit
 				spos = probe.Position + surfN * BODY_H
-			else                                                          -- ran off the wall
-				climbing = false;  hum.PlatformStand = false
-				hrp.CFrame = CFrame.new(spos + Vector3.new(0, 0.6, 0))
+			else                                                          -- ran off the top/edge of the wall
+				stepOff(spos, 0.6)
 			end
 		end
 		if climbing then
 			local wUp = Vector3.new(0, 1, 0) - surfN * surfN.Y
-			if wUp.Magnitude < 0.08 then wUp = flat - surfN * flat:Dot(surfN) end   -- ceiling: use facing
+			local ceiling = wUp.Magnitude < 0.08
+			if ceiling then wUp = flat - surfN * flat:Dot(surfN) end       -- ceiling: use facing
 			wUp = wUp.Unit
-			local wRight = surfN:Cross(wUp).Unit
+			local wRight = wUp:Cross(surfN).Unit   -- along the wall, to the climber's right (A/D)
 			if jumpReq then
 				jumpReq, climbing = false, false
-				hum.PlatformStand = false
+				hum.PlatformStand = false;  grabCD = 0.5
 				hrp.CFrame = CFrame.new(spos + surfN * 1.5)
 				hrp.AssemblyLinearVelocity = surfN * 26 + Vector3.new(0, 34, 0)
 			else
 				spos += (wUp * -mv.Z + wRight * mv.X) * CLIMB_SPD * dt
 				local re = cast(spos + surfN * (BODY_H + 2), -surfN * (BODY_H + 9))
 				if re then spos = re.Position + surfN * BODY_H end
-				hrp.CFrame = CFrame.new(spos)
-				hrp.AssemblyLinearVelocity = Vector3.zero
+				--// climbing DOWN and the floor is right here -> step off onto it (don't sink through)
+				local floor = cast(spos + Vector3.new(0, BODY_H + 1, 0), Vector3.new(0, -(BODY_H * 2 + 4), 0))
+				if not ceiling and floor and floor.Normal.Y > 0.5
+					and spos.Y - floor.Position.Y <= BODY_H + 0.6 and mv.Z > 0.03 then
+					stepOff(Vector3.new(spos.X, floor.Position.Y + BODY_H, spos.Z) + flat * 0.5 * SP, 0.4)
+				else
+					hrp.CFrame = CFrame.new(spos)
+					hrp.AssemblyLinearVelocity = Vector3.zero
+				end
 			end
 		end
 
@@ -1264,31 +1701,16 @@ do
 	local SRATE   = 26          -- server update Hz (drop if it strains the server)
 	local SMIRROR = {}          -- { { sp = serverPart, lp = localPart } }
 	local spiderPushLook       -- (re)sends per-part colour/material/transparency to the server
-	local function claim(p)
-		EscalateEvent:FireServer(PartOwnership, { [1] = p })
-		local t0 = os.clock()
-		repeat task.wait(0.01) until p:FindFirstChild("RRPartOwner") or os.clock() - t0 > 5
-		return p:FindFirstChild("RRPartOwner") ~= nil
+	local cf0 = CFrame.new(0, -400, 0)
+	local CHUNK = 40   -- F3X calls may cap entries; chunk big batches
+	local function batched(action, entries, extra)
+		for i = 1, #entries, CHUNK do
+			local c = {}
+			for j = i, math.min(i + CHUNK - 1, #entries) do c[#c + 1] = entries[j] end
+			if extra ~= nil then pcall(invoke, ep, action, c, extra) else pcall(invoke, ep, action, c) end
+			task.wait()
+		end
 	end
-	local function twin(lp)
-		local ball = (lp.Shape == Enum.PartType.Ball)
-		local cf = CFrame.new(0, -400, 0)
-		local p = ep:InvokeServer("CreatePart", ball and "Ball" or "Normal", cf, workspace)
-		if not (p and claim(p)) then return end
-		ep:InvokeServer("SyncResize",    { [1] = { Part = p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = cf } })
-		ep:InvokeServer("SetName",       { p }, "Sp")
-		ep:InvokeServer("SyncColor",     { [1] = { Part = p, Color = lp.Color } })
-		ep:InvokeServer("SyncCollision", { [1] = { Part = p, CanCollide = false } })
-		ep:InvokeServer("CreateMeshes",  { [1] = { Part = p } })
-		ep:InvokeServer("SyncMesh",      { [1] = { Part = p, MeshType = ball and Enum.MeshType.Sphere or Enum.MeshType.Brick,
-			Scale = lp.Size * MESH_SCALE } })
-		ep:InvokeServer("SyncMaterial",  { [1] = { Part = p, Material = lp.Material, Transparency = lp.Transparency } })
-		ep:InvokeServer("SyncAnchor",    { [1] = { Part = p, Anchored = true } })
-		castShadowOff(p);  p.CanQuery = false
-		spiderServer[#spiderServer + 1] = p
-		SMIRROR[#SMIRROR + 1] = { sp = p, lp = lp }
-	end
-
 	local mirrorList = { body, hull, core, under, eye, mand1, mand2, abdo }
 	for _, k in ipairs(spikes) do mirrorList[#mirrorList + 1] = k end
 	for _, l in ipairs(legs) do
@@ -1297,22 +1719,77 @@ do
 			mirrorList[#mirrorList + 1] = l[nm]
 		end
 	end
+
+	--// build all twins: create in parallel, then claim + configure in BATCHES (few remote calls, not ~1000)
 	task.spawn(function()
-		for _, lp in ipairs(mirrorList) do twin(lp);  task.wait(0.03) end
+		local made, qi, done = {}, 0, 0
+		local function worker()
+			while true do
+				qi += 1;  local idx = qi
+				local lp = mirrorList[idx]
+				if not lp then done += 1;  return end
+				local ball = (lp.Shape == Enum.PartType.Ball)
+				local p = ep:InvokeServer("CreatePart", ball and "Ball" or "Normal", cf0, workspace)
+				if p then made[idx] = { p = p, lp = lp, ball = ball } end
+			end
+		end
+		for _ = 1, 8 do task.spawn(worker) end
+		repeat task.wait(0.1) until done >= 8
+
+		local list = {}
+		for idx = 1, #mirrorList do if made[idx] then list[#list + 1] = made[idx].p end end
+		if #list == 0 then return end
+		for i = 1, #list, 30 do                                -- claim in chunks
+			local chunk = {}
+			for j = i, math.min(i + 29, #list) do chunk[#chunk + 1] = list[j] end
+			EscalateEvent:FireServer(PartOwnership, chunk)
+			task.wait(0.06)
+		end
+		local t0 = os.clock()
+		repeat task.wait(0.1) until (list[#list]:FindFirstChild("RRPartOwner")) or os.clock() - t0 > 12
+
+		local resize, names, cmesh, brick, sphere, matB = {}, {}, {}, {}, {}, {}
+		for idx = 1, #mirrorList do
+			local e = made[idx]
+			if e and e.p:FindFirstChild("RRPartOwner") then
+				SMIRROR[#SMIRROR + 1] = { sp = e.p, lp = e.lp }
+				spiderServer[#spiderServer + 1] = e.p
+				names[#names + 1] = e.p
+				resize[#resize + 1] = { Part = e.p, Size = Vector3.new(MICRO, MICRO, MICRO), CFrame = cf0 }
+				cmesh[#cmesh + 1]  = { Part = e.p }
+				local entry = { Part = e.p, MeshType = e.ball and Enum.MeshType.Sphere or Enum.MeshType.Brick, Scale = e.lp.Size * MESH_SCALE }
+				if e.ball then sphere[#sphere + 1] = entry else brick[#brick + 1] = entry end
+				matB[#matB + 1] = { Part = e.p, Material = e.lp.Material, Transparency = e.lp.Transparency }
+			end
+		end
+		local coll, anch = {}, {}
+		for _, m in ipairs(SMIRROR) do
+			coll[#coll + 1] = { Part = m.sp, CanCollide = false }
+			anch[#anch + 1] = { Part = m.sp, Anchored = true }
+		end
+		batched("SyncResize", resize)
+		batched("SetName", names, "Sp")
+		batched("SyncCollision", coll)
+		batched("CreateMeshes", cmesh)
+		batched("SyncMesh", brick)
+		batched("SyncMesh", sphere)
+		batched("SyncMaterial", matB)
+		batched("SyncAnchor", anch)
+		for _, m in ipairs(SMIRROR) do castShadowOff(m.sp);  m.sp.CanQuery = false end
+		if spiderPushLook then spiderPushLook() end
 		print("[spider] server mirror:", #SMIRROR, "/", #mirrorList)
 	end)
 
 	--// push per-part colour / material / transparency to the server (skin change / toggle)
 	spiderPushLook = function()
 		task.spawn(function()
-			local mat = {}
+			local mat, col = {}, {}
 			for _, m in ipairs(SMIRROR) do
 				mat[#mat + 1] = { Part = m.sp, Material = m.lp.Material, Transparency = m.lp.Transparency }
+				col[#col + 1] = { Part = m.sp, Color = m.lp.Color }
 			end
-			if #mat > 0 then pcall(invoke, ep, "SyncMaterial", mat) end
-			local col = {}
-			for _, m in ipairs(SMIRROR) do col[#col + 1] = { Part = m.sp, Color = m.lp.Color } end
-			if #col > 0 then pcall(invoke, ep, "SyncColor", col) end
+			batched("SyncMaterial", mat)
+			batched("SyncColor", col)
 		end)
 	end
 
@@ -1326,14 +1803,22 @@ do
 			ms[#ms + 1] = { Part = m.sp, Scale = m.lp.Size * MESH_SCALE }
 			m.sp.LocalTransparencyModifier = 1;  m.sp.CastShadow = false
 		end
-		if #mv > 0 then
-			task.spawn(function() pcall(invoke, ep, "SyncMove", mv) end)
-			task.spawn(function() pcall(invoke, ep, "SyncMesh", ms) end)
+		for i = 1, #mv, CHUNK do
+			local a, b = {}, {}
+			for j = i, math.min(i + CHUNK - 1, #mv) do a[#a + 1] = mv[j];  b[#b + 1] = ms[j] end
+			task.spawn(function() pcall(invoke, ep, "SyncMove", a) end)
+			task.spawn(function() pcall(invoke, ep, "SyncMesh", b) end)
 		end
 	end)
 
 	--// ---- Special Skins: not just colours — proportions, gait, materials, decorations ----
 	local SSKINS = {
+		--// default: cellar spider (daddy long-legs) — tiny pale body, very long thin sprawling legs, gangly bob
+		{ name="Cellar Spider", sp=1.05, w=0.2, fem=6.6, tib=8.8, reach=12.4, bh=2.0, sw=0.3, lift=2.8, grate=0.17, gbob=0.05,
+		  ang={16,42,138,164,-16,-42,-138,-164},
+		  bmat=Enum.Material.SmoothPlastic, lmat=Enum.Material.SmoothPlastic, col=Color3.fromRGB(188,182,170), refl=0, trans=0.22, acc=Color3.fromRGB(150,144,132),
+		  bsz=Vector3.new(2.2,0.9,2.8), hsz=Vector3.new(1.7,1.0,1.9) },
+
 		{ name="Recon",   sp=1.4,  w=0.42, fem=3.8, tib=5.0, reach=7.2, bh=3.6, sw=0.42, lift=1.9, grate=0.09, gbob=0.12,
 		  ang={34,66,114,146,-34,-66,-114,-146},
 		  bmat=Enum.Material.DiamondPlate, lmat=Enum.Material.Metal, col=GUN, refl=0, trans=0, acc=nil,
@@ -1388,17 +1873,60 @@ do
 		  bmat=Enum.Material.DiamondPlate, lmat=Enum.Material.Metal, col=Color3.fromRGB(46,48,54), refl=0.1, trans=0, acc=Color3.fromRGB(255,120,20),
 		  bsz=Vector3.new(5.4,2.1,6.2), hsz=Vector3.new(3.8,2.3,4.2), mech=true, spikes=true,
 		  particle={ col=Color3.fromRGB(255,120,20), rate=14, rear=true } },
+
+		--// ---- realistic species (no neon, matte materials, natural proportions & gait) ----
+		{ name="Tarantula",  sp=1.7,  w=0.6,  fem=3.4, tib=4.2, reach=6.6, bh=3.9, sw=0.5,  lift=1.5, grate=0.06, gbob=0.16,
+		  ang={40,72,108,140,-40,-72,-108,-140},
+		  bmat=Enum.Material.Fabric, lmat=Enum.Material.Fabric, col=Color3.fromRGB(74,48,32), refl=0, trans=0, acc=Color3.fromRGB(46,30,20),
+		  bsz=Vector3.new(5.2,2.3,6.0), hsz=Vector3.new(3.6,2.4,4.0), abdomen=true },
+
+		{ name="Black Widow",sp=1.3,  w=0.3,  fem=4.6, tib=6.0, reach=8.6, bh=2.7, sw=0.36, lift=2.4, grate=0.13, gbob=0.06,
+		  ang={28,54,126,152,-28,-54,-126,-152},
+		  bmat=Enum.Material.Glass, lmat=Enum.Material.SmoothPlastic, col=Color3.fromRGB(9,8,10), refl=0.16, trans=0, acc=Color3.fromRGB(150,16,32),
+		  bsz=Vector3.new(3.0,2.1,3.4), hsz=Vector3.new(2.2,1.6,2.4), abdomen=true },
+
+		{ name="Wolf Spider",sp=1.4,  w=0.44, fem=3.8, tib=4.9, reach=7.2, bh=3.4, sw=0.44, lift=1.9, grate=0.12, gbob=0.11,
+		  ang={34,66,114,146,-34,-66,-114,-146},
+		  bmat=Enum.Material.Fabric, lmat=Enum.Material.Fabric, col=Color3.fromRGB(92,80,62), refl=0, trans=0, acc=Color3.fromRGB(60,52,40),
+		  bsz=Vector3.new(4.2,1.6,5.0), hsz=Vector3.new(3.0,1.8,3.2) },
+
+		{ name="Jumping Spider",sp=1.0,w=0.42, fem=2.6, tib=3.0, reach=4.8, bh=2.8, sw=0.42, lift=1.7, grate=0.16, gbob=0.22,
+		  ang={44,74,106,136,-44,-74,-106,-136},
+		  bmat=Enum.Material.Fabric, lmat=Enum.Material.Fabric, col=Color3.fromRGB(40,36,34), refl=0.04, trans=0, acc=Color3.fromRGB(120,180,190),
+		  bsz=Vector3.new(2.6,1.7,2.8), hsz=Vector3.new(2.4,2.0,2.4), abdomen=true },
+
+		{ name="Huntsman",   sp=1.5,  w=0.36, fem=5.4, tib=7.2, reach=10.4,bh=2.4, sw=0.34, lift=2.2, grate=0.15, gbob=0.05,
+		  ang={20,46,134,160,-20,-46,-134,-160},
+		  bmat=Enum.Material.Fabric, lmat=Enum.Material.Fabric, col=Color3.fromRGB(122,98,70), refl=0, trans=0, acc=Color3.fromRGB(82,64,46),
+		  bsz=Vector3.new(4.6,1.1,5.0), hsz=Vector3.new(3.4,1.4,3.0) },
+
+		{ name="Camel Spider",sp=1.45,w=0.42, fem=3.9, tib=4.6, reach=7.4, bh=3.2, sw=0.5,  lift=1.8, grate=0.19, gbob=0.12,
+		  ang={30,58,122,150,-30,-58,-122,-150},
+		  bmat=Enum.Material.Sand, lmat=Enum.Material.Sand, col=Color3.fromRGB(198,166,112), refl=0, trans=0, acc=Color3.fromRGB(150,120,78),
+		  bsz=Vector3.new(4.4,1.8,5.6), hsz=Vector3.new(3.4,2.0,3.8) },
+
+		{ name="Orb Weaver", sp=1.4,  w=0.34, fem=4.0, tib=5.0, reach=7.6, bh=3.3, sw=0.4,  lift=2.0, grate=0.1,  gbob=0.09,
+		  ang={32,62,118,148,-32,-62,-118,-148},
+		  bmat=Enum.Material.Fabric, lmat=Enum.Material.Fabric, col=Color3.fromRGB(182,152,72), refl=0, trans=0, acc=Color3.fromRGB(92,72,40),
+		  bsz=Vector3.new(3.4,2.6,3.8), hsz=Vector3.new(2.6,1.7,2.8), abdomen=true },
+
+		{ name="Wandering",  sp=1.5,  w=0.4,  fem=4.4, tib=5.8, reach=8.4, bh=3.6, sw=0.46, lift=2.3, grate=0.13, gbob=0.1,
+		  ang={30,60,120,150,-30,-60,-120,-150},
+		  bmat=Enum.Material.Fabric, lmat=Enum.Material.Fabric, col=Color3.fromRGB(66,44,36), refl=0.02, trans=0, acc=Color3.fromRGB(140,60,40),
+		  bsz=Vector3.new(4.4,1.6,5.4), hsz=Vector3.new(3.2,1.9,3.6) },
 	}
 	local ssIdx = 1
+	local spiderSizeMul = 1
 	local function acCol() return SSKINS[ssIdx].acc or glow() end
 
 	local function applySSkin(n)
 		ssIdx = (((n or ssIdx + 1) - 1) % #SSKINS) + 1
 		local S = SSKINS[ssIdx]
-		CFG.SP, CFG.W, CFG.FEMUR, CFG.TIBIA = S.sp, S.w, S.fem, S.tib
+		local sp = S.sp * spiderSizeMul
+		CFG.SP, CFG.W, CFG.FEMUR, CFG.TIBIA = sp, S.w, S.fem, S.tib
 		CFG.REACH, CFG.BODY_H, CFG.SWING, CFG.LIFT = S.reach, S.bh, S.sw, S.lift
 		CFG.GRATE, CFG.GBOB, CFG.ANG, CFG.mech = S.grate, S.gbob, S.ang, S.mech or false
-		local sp, ac = S.sp, acCol()
+		local ac = acCol()
 		local tr = spiderOn and (S.trans or 0) or 1
 		local acT = spiderOn and 0 or 1
 		local mShow = (S.mech and spiderOn) and (S.trans or 0) or 1   -- mech dress-up parts (MaxMech only)
@@ -1455,6 +1983,11 @@ do
 		if ssBtn then ssBtn.Text = "SSkin: " .. S.name end
 	end
 	_G.R6Rig_SSkin = applySSkin
+	setSpiderSize = function(m)
+		spiderSizeMul = math.clamp(tonumber(m) or 1, 0.2, 5)
+		applySSkin(ssIdx)
+	end
+	_G.R6Rig_SpiderSize = setSpiderSize
 
 	spiderRecolor = function()
 		if SSKINS[ssIdx].acc == nil then applySSkin(ssIdx) end   -- Recon follows the regular skin glow
@@ -1503,7 +2036,11 @@ if UIS.TouchEnabled then   --// mobile JUMP button (native one is hidden while p
 	jb.TextSize = 15
 	jb.Parent = mobileJumpGui
 	Instance.new("UICorner", jb).CornerRadius = UDim.new(1, 0)
-	jb.MouseButton1Down:Connect(function() if piloting then hum.Jump = true end end)
+	jb.MouseButton1Down:Connect(function()
+		if not piloting then return end
+		if spiderOn and spiderWallJump then spiderWallJump() end   -- jump off the wall while climbing
+		hum.Jump = true                                           -- normal hop otherwise
+	end)
 end
 
 applySkin(1)
@@ -1550,55 +2087,11 @@ pilotBtn.Parent = frame
 Instance.new("UICorner", pilotBtn).CornerRadius = UDim.new(0, 5)
 pilotBtn.MouseButton1Click:Connect(function() setPilot(not piloting) end)
 
---// noob-size slider
-local sizeLabel = Instance.new("TextLabel")
-sizeLabel.Size = UDim2.new(1, -12, 0, 14)
-sizeLabel.Position = UDim2.fromOffset(6, 62)
-sizeLabel.BackgroundTransparency = 1
-sizeLabel.Text = "Noob size: 1.00x"
-sizeLabel.TextColor3 = Color3.fromRGB(200, 200, 208)
-sizeLabel.TextXAlignment = Enum.TextXAlignment.Left
-sizeLabel.Font = Enum.Font.Gotham
-sizeLabel.TextSize = 11
-sizeLabel.Parent = frame
-
-local sTrack = Instance.new("Frame")
-sTrack.Size = UDim2.new(1, -16, 0, 6)
-sTrack.Position = UDim2.fromOffset(8, 80)
-sTrack.BackgroundColor3 = Color3.fromRGB(56, 56, 66)
-sTrack.BorderSizePixel = 0
-sTrack.Parent = frame
-Instance.new("UICorner", sTrack).CornerRadius = UDim.new(1, 0)
-
-local sKnob = Instance.new("Frame")
-sKnob.Size = UDim2.fromOffset(12, 16)
-sKnob.AnchorPoint = Vector2.new(0.5, 0.5)
-sKnob.Position = UDim2.new(SCALE_MID, 0, 0.5, 0)
-sKnob.BackgroundColor3 = Color3.fromRGB(210, 210, 220)
-sKnob.BorderSizePixel = 0
-sKnob.Parent = sTrack
-Instance.new("UICorner", sKnob).CornerRadius = UDim.new(1, 0)
-
-local sDrag = false
-local function sliderTo(px)
-	local rel = math.clamp((px - sTrack.AbsolutePosition.X) / sTrack.AbsoluteSize.X, 0, 1)
-	sKnob.Position = UDim2.new(rel, 0, 0.5, 0)
-	local k = SCALE_MIN * (SCALE_MAX / SCALE_MIN) ^ rel   -- geometric: equal % change per pixel, centre = 1x
-	sizeLabel.Text = string.format("Noob size: %.2fx", k)
-	setScale(k)
-end
-sKnob.InputBegan:Connect(function(io)
-	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then sDrag = true end
-end)
-sTrack.InputBegan:Connect(function(io)
-	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then
-		sDrag = true; sliderTo(io.Position.X)
-	end
-end)
+local activeSlider   -- the slider handle currently being dragged (see UIS.InputChanged / InputEnded)
 
 local scroll = Instance.new("ScrollingFrame")
-scroll.Size = UDim2.new(1, -12, 1, -102)
-scroll.Position = UDim2.fromOffset(6, 98)
+scroll.Size = UDim2.new(1, -12, 1, -68)
+scroll.Position = UDim2.fromOffset(6, 62)
 scroll.BackgroundTransparency = 1
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 4
@@ -1610,13 +2103,184 @@ grid.CellSize = UDim2.fromOffset(82, 26)
 grid.CellPadding = UDim2.fromOffset(4, 4)
 grid.SortOrder = Enum.SortOrder.LayoutOrder
 
+--// ---- sliders panel (overlay, toggled by "Sliders"; has its own X to close) ----
+local sliderPanel = Instance.new("ScrollingFrame")
+sliderPanel.Size = UDim2.new(1, -12, 1, -68)
+sliderPanel.Position = UDim2.fromOffset(6, 62)
+sliderPanel.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+sliderPanel.BorderSizePixel = 0
+sliderPanel.ScrollBarThickness = 4
+sliderPanel.CanvasSize = UDim2.new()
+sliderPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+sliderPanel.Visible = false
+sliderPanel.ZIndex = 8
+sliderPanel.Parent = frame
+Instance.new("UICorner", sliderPanel).CornerRadius = UDim.new(0, 6)
+local spList = Instance.new("UIListLayout", sliderPanel)
+spList.Padding = UDim.new(0, 6)
+spList.SortOrder = Enum.SortOrder.LayoutOrder
+Instance.new("UIPadding", sliderPanel).PaddingTop = UDim.new(0, 5)
+
+local spClose = Instance.new("TextButton")
+spClose.Size = UDim2.new(1, -10, 0, 18);  spClose.LayoutOrder = 0
+spClose.BackgroundColor3 = Color3.fromRGB(60, 40, 44);  spClose.BorderSizePixel = 0
+spClose.Text = "\226\156\149  close";  spClose.TextColor3 = Color3.fromRGB(230, 220, 222)
+spClose.Font = Enum.Font.GothamBold;  spClose.TextSize = 11;  spClose.ZIndex = 9
+spClose.Parent = sliderPanel
+Instance.new("UICorner", spClose).CornerRadius = UDim.new(0, 4)
+spClose.MouseButton1Click:Connect(function() sliderPanel.Visible = false end)
+
+local function makeSlider(order, cfg)
+	-- cfg = { name, def, min, max, log, fmt, apply }
+	local S = { min = cfg.min, max = cfg.max, def = cfg.def, value = cfg.def, log = cfg.log }
+	local fmt = cfg.fmt or "%.2f"
+
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, -10, 0, 48);  row.LayoutOrder = order
+	row.BackgroundColor3 = Color3.fromRGB(30, 30, 38);  row.BorderSizePixel = 0
+	row.ZIndex = 9;  row.Parent = sliderPanel
+	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 5)
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, -52, 0, 14);  lbl.Position = UDim2.fromOffset(6, 3)
+	lbl.BackgroundTransparency = 1;  lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.TextColor3 = Color3.fromRGB(210, 210, 218);  lbl.Font = Enum.Font.Gotham;  lbl.TextSize = 11
+	lbl.ZIndex = 10;  lbl.Parent = row
+
+	local rst = Instance.new("TextButton")
+	rst.Size = UDim2.fromOffset(40, 14);  rst.Position = UDim2.new(1, -44, 0, 3)
+	rst.BackgroundColor3 = Color3.fromRGB(52, 52, 64);  rst.BorderSizePixel = 0
+	rst.Text = "reset";  rst.TextColor3 = Color3.fromRGB(210, 210, 218)
+	rst.Font = Enum.Font.Gotham;  rst.TextSize = 10;  rst.ZIndex = 10;  rst.Parent = row
+	Instance.new("UICorner", rst).CornerRadius = UDim.new(0, 3)
+
+	local track = Instance.new("Frame")
+	track.Size = UDim2.new(1, -16, 0, 6);  track.Position = UDim2.fromOffset(8, 22)
+	track.BackgroundColor3 = Color3.fromRGB(58, 58, 70);  track.BorderSizePixel = 0
+	track.ZIndex = 10;  track.Parent = row
+	Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(12, 15);  knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.BackgroundColor3 = Color3.fromRGB(212, 212, 222);  knob.BorderSizePixel = 0
+	knob.ZIndex = 11;  knob.Parent = track
+	Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+	local function mkbox(x, txt)
+		local b = Instance.new("TextBox")
+		b.Size = UDim2.fromOffset(42, 14);  b.Position = x
+		b.BackgroundColor3 = Color3.fromRGB(44, 44, 54);  b.BorderSizePixel = 0
+		b.Text = txt;  b.TextColor3 = Color3.fromRGB(200, 200, 210)
+		b.Font = Enum.Font.Gotham;  b.TextSize = 10;  b.ClearTextOnFocus = false
+		b.ZIndex = 10;  b.Parent = row
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 3)
+		return b
+	end
+	local minBox = mkbox(UDim2.fromOffset(8, 31), tostring(cfg.min))
+	local maxBox = mkbox(UDim2.new(1, -46, 0, 31), tostring(cfg.max))
+
+	local function relOf(v)
+		if S.log and S.min > 0 and S.max > 0 then return math.log(v / S.min) / math.log(S.max / S.min) end
+		return (v - S.min) / (S.max - S.min)
+	end
+	local function valOf(rel)
+		if S.log and S.min > 0 and S.max > 0 then return S.min * (S.max / S.min) ^ rel end
+		return S.min + (S.max - S.min) * rel
+	end
+	function S:refresh()
+		local rel = math.clamp(relOf(self.value), 0, 1)
+		knob.Position = UDim2.new(rel, 0, 0.5, 0)
+		lbl.Text = cfg.name .. ": " .. string.format(fmt, self.value)
+	end
+	function S:setValue(v, skipApply)
+		self.value = math.clamp(v, math.min(S.min, S.max), math.max(S.min, S.max))
+		self:refresh()
+		if not skipApply and cfg.apply then cfg.apply(self.value) end
+	end
+	function S:dragTo(px)
+		local rel = math.clamp((px - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		self:setValue(valOf(rel))
+	end
+	local function beginDrag(io)
+		if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then
+			activeSlider = S;  S:dragTo(io.Position.X)
+		end
+	end
+	track.InputBegan:Connect(beginDrag)
+	knob.InputBegan:Connect(beginDrag)
+	rst.MouseButton1Click:Connect(function() S:setValue(S.def) end)
+	local function commitRange()
+		local lo, hi = tonumber(minBox.Text), tonumber(maxBox.Text)
+		if lo and hi and hi > lo then
+			S.min, S.max = lo, hi
+			minBox.Text, maxBox.Text = tostring(lo), tostring(hi)
+			S:setValue(S.value, true)
+		else
+			minBox.Text, maxBox.Text = tostring(S.min), tostring(S.max)
+		end
+	end
+	minBox.FocusLost:Connect(commitRange)
+	maxBox.FocusLost:Connect(commitRange)
+
+	S:setValue(cfg.def, true)
+	return S
+end
+
+makeSlider(1, { name = "Noob size", def = 1, min = 0.1, max = 12, log = true, fmt = "%.2fx",
+	apply = function(v) setScale(v) end })
+makeSlider(2, { name = "Walk speed", def = 16, min = 0, max = 120, fmt = "%.0f",
+	apply = function(v) pilotWS = v;  if piloting then hum.WalkSpeed = v end end })
+makeSlider(3, { name = "Jump power", def = 50, min = 0, max = 250, fmt = "%.0f",
+	apply = function(v) pilotJP = v;  hum.UseJumpPower = true;  hum.JumpPower = v end })
+makeSlider(4, { name = "Spider size", def = 1, min = 0.2, max = 5, log = true, fmt = "%.2fx",
+	apply = function(v) if setSpiderSize then setSpiderSize(v) end end })
+
+--// .anim library picker (overlay list, toggled by the "Anims" button)
+local animPanel = Instance.new("ScrollingFrame")
+animPanel.Size = UDim2.new(1, -12, 1, -68)
+animPanel.Position = UDim2.fromOffset(6, 62)
+animPanel.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+animPanel.BorderSizePixel = 0
+animPanel.ScrollBarThickness = 4
+animPanel.CanvasSize = UDim2.new()
+animPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+animPanel.Visible = false
+animPanel.ZIndex = 8
+animPanel.Parent = frame
+Instance.new("UICorner", animPanel).CornerRadius = UDim.new(0, 6)
+local apList = Instance.new("UIListLayout", animPanel)
+apList.Padding = UDim.new(0, 2)
+apList.SortOrder = Enum.SortOrder.LayoutOrder
+Instance.new("UIPadding", animPanel).PaddingTop = UDim.new(0, 3)
+for i, nm in ipairs(ANIMS) do
+	local ab = Instance.new("TextButton")
+	ab.Size = UDim2.new(1, -8, 0, 19)
+	ab.LayoutOrder = i
+	ab.BackgroundColor3 = Color3.fromRGB(42, 42, 52)
+	ab.BorderSizePixel = 0
+	ab.Text = nm
+	ab.TextColor3 = Color3.fromRGB(226, 226, 233)
+	ab.Font = Enum.Font.Gotham
+	ab.TextSize = 11
+	ab.ZIndex = 9
+	ab.Parent = animPanel
+	Instance.new("UICorner", ab).CornerRadius = UDim.new(0, 4)
+	ab.MouseButton1Click:Connect(function()
+		task.spawn(playAnim, nm)   -- playAnim yields on first fetch
+		animPanel.Visible = false
+	end)
+end
+
 local BUTTONS = {
 	{ "Idle", "idle" }, { "Walk", "walk" }, { "Run", "run" }, { "Jump", "jump" },
 	{ "Fall", "fall" }, { "Climb", "climb" }, { "Sit", "sit" }, { "Wave", "wave" },
 	{ "Point", "point" }, { "Dance", "dance" }, { "Dance 2", "dance2" }, { "Dance 3", "dance3" },
 	{ "Laugh", "laugh" }, { "Cheer", "cheer" }, { "Stop", "stop" }, { "Mirror", "__mirror" },
 	{ "Sword", "__sword" }, { "Swing", "__swing" }, { "Skin: Classic", "__skin" },
-	{ "Spy: Off", "__spy" }, { "Spider: Off", "__spider" }, { "SSkin: Recon", "__sskin" },
+	{ "Spy: Off", "__spy" }, { "Spider: Off", "__spider" }, { "SSkin: Cellar", "__sskin" },
+	{ "Dance \226\150\184", "__dance" }, { "Criss Cross", "__crisscross" },
+	{ "Anims", "__anims" }, { "Rat Dance", "__ratdance" }, { "Fortnite", "__fortnite" },
+	{ "Sliders", "__sliders" },
 }
 
 for i, b in ipairs(BUTTONS) do
@@ -1654,6 +2318,23 @@ for i, b in ipairs(BUTTONS) do
 			setSpider(not spiderOn)
 		elseif b[2] == "__sskin" then
 			if _G.R6Rig_SSkin then _G.R6Rig_SSkin() end   -- nil = advance to next
+		elseif b[2] == "__dance" then
+			danceIdx = (danceIdx % #DANCES) + 1
+			local d = DANCES[danceIdx]
+			if d.proc then playProcDance(d.proc) else playDanceId(d[2]) end
+			btn.Text = d[1]
+		elseif b[2] == "__crisscross" then
+			playProcDance("crisscross")
+		elseif b[2] == "__anims" then
+			animPanel.Visible = not animPanel.Visible
+			if animPanel.Visible then sliderPanel.Visible = false end
+		elseif b[2] == "__sliders" then
+			sliderPanel.Visible = not sliderPanel.Visible
+			if sliderPanel.Visible then animPanel.Visible = false end
+		elseif b[2] == "__ratdance" then
+			task.spawn(playAnim, "RatDance")
+		elseif b[2] == "__fortnite" then
+			task.spawn(playAnim, "Fortnite")
 		else
 			playCat(b[2])
 		end
@@ -1677,13 +2358,13 @@ UIS.InputChanged:Connect(function(io)
 		if dragging then
 			local d = io.Position - dragStart
 			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-		elseif sDrag then
-			sliderTo(io.Position.X)
+		elseif activeSlider then
+			activeSlider:dragTo(io.Position.X)
 		end
 	end
 end)
 UIS.InputEnded:Connect(function(io)
-	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then sDrag = false end
+	if io.UserInputType == Enum.UserInputType.MouseButton1 or io.UserInputType == Enum.UserInputType.Touch then activeSlider = nil end
 end)
 
 --// mobile: native thumbstick moves, native button jumps, tap-anywhere swings (UIS.TouchTap above).
@@ -1704,11 +2385,12 @@ end)
 
 --// ---------- start ----------
 setMirror(false)
-playCore("idle");  autoState = "idle"
+setPState("idle")   -- start on the procedural idle
 
 _G.R6Rig_Stop = function()
 	alive = false
 	pcall(function() RunService:UnbindFromRenderStep("R6RigSword") end)
+	pcall(function() RunService:UnbindFromRenderStep("R6RigPose") end)
 	if piloting then setPilot(false) end
 	stopTrack()
 	if gui then gui:Destroy() end
@@ -1723,4 +2405,4 @@ _G.R6Rig_Stop = function()
 	print("[rig] stopped")
 end
 
-print("[rig] running - PILOT | Spider (climbs walls) + SSkins | Spy | Skin | Noob slider | _G.R6Rig_Stop()")
+print("[rig] running - PILOT | procedural anims + Criss Cross | 63 .anim dances via 'Anims' btn / _G.R6Rig_Anim(\"RatDance\") | Spider + SSkins | Spy | _G.R6Rig_Stop()")
